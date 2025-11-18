@@ -15,7 +15,7 @@ from pipecat.frames.frames import (
     FunctionCallCancelFrame,
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
-    StartInterruptionFrame,
+    InterruptionFrame,
 )
 
 from pipecat.services.google import (
@@ -76,9 +76,12 @@ class AdkAssistantContextAggregator(GoogleAssistantContextAggregator):
         # so we don't need to do anything here.
         pass  # No-op: ADK manages assistant messages internally
 
-    async def _handle_interruptions(self, frame: StartInterruptionFrame):
-        await super()._handle_interruptions(frame)
+    async def _handle_interruptions(self, frame: InterruptionFrame):
+        # Save the spoken text BEFORE calling super(), because super() will clear it
         spoken_text = self._aggregation
+
+        await super()._handle_interruptions(frame)
+
         if spoken_text:
             await self._add_interruption_event(spoken_text)
 
