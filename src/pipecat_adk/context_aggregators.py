@@ -5,10 +5,10 @@ architecture with Google ADK's session-based conversation management.
 """
 
 import time
-from typing import List, Optional
+from typing import Optional
 
 from google.adk.events.event import Event
-from google.adk.events.event_actions import EventActions
+from google.adk.runners import Runner
 from google.genai.types import Content, Part
 from loguru import logger
 from pipecat.frames.frames import (
@@ -17,97 +17,32 @@ from pipecat.frames.frames import (
     FunctionCallResultFrame,
     StartInterruptionFrame,
 )
-from pipecat.processors.aggregators.llm_response import (
-    LLMAssistantContextAggregator,
-)
+
 from pipecat.services.google import (
     GoogleLLMContext,
     GoogleUserContextAggregator,
+    GoogleAssistantContextAggregator
 )
 
 from .types import SessionParams
 
 
 class AdkUserContextAggregator(GoogleUserContextAggregator):
-    """Packages user input for ADK agent processing.
-
-    This aggregator clears Pipecat's context (since ADK manages the conversation
-    history) and wraps user speech in <candidate> tags for ADK processing.
-
-    Extension Point:
-        Override `get_custom_context_parts()` to add custom context like
-        warnings, metadata, time tracking, etc.
-
-    Example:
-        class MyUserAggregator(AdkUserContextAggregator):
-            async def get_custom_context_parts(self):
-                parts = []
-                if warning := await self.check_device_status():
-                    parts.append(Part(text=f"<system>{warning}</system>"))
-                return parts
-    """
-
     def __init__(self, context: Optional[GoogleLLMContext] = None):
-        """Initialize the user context aggregator.
-
-        Args:
-            context: Optional GoogleLLMContext. If not provided, creates a new one.
-        """
         super().__init__(context=context or GoogleLLMContext())
 
     async def handle_aggregation(self, aggregation: str):
-        """Package user input for ADK agent.
+        content = await self._aggregation_to_content(aggregation)
 
-        Clears Pipecat's context (ADK manages conversation) and wraps user
-        speech in <candidate> tags. Calls extension point for custom context.
-
-        Args:
-            aggregation: The aggregated user speech from STT
-        """
-        # Clear Pipecat context - ADK manages conversation history
+        # Only keep the current user input in context
         self._context.set_messages([])
+        self._context.add_message(content) # type: ignore
 
-        # Wrap user input in <candidate> tags
-        parts = [Part(text=f"<candidate>{aggregation}</candidate>")]
+    async def _aggregation_to_content(self, aggregation: str) -> Content:
+        parts = [Part(text=aggregation)]
+        return Content(role="user", parts=parts)
 
-        # Extension point: add custom context (warnings, metadata, etc.)
-        custom_parts = await self.get_custom_context_parts()
-        parts.extend(custom_parts)
-
-        # Add to context as single user message
-        self._context.add_message(Content(role="user", parts=parts))
-
-    async def get_custom_context_parts(self) -> List[Part]:
-        """Extension point for adding custom context.
-
-        Override this method to add custom context parts like warnings,
-        metadata, time tracking, device status, etc.
-
-        Returns:
-            List of Part objects to add to the user message
-
-        Example:
-            async def get_custom_context_parts(self):
-                parts = []
-
-                # Add device warning
-                if not self.camera_enabled:
-                    parts.append(Part(
-                        text="<system>Camera is disabled. Ask user to enable it.</system>"
-                    ))
-
-                # Add time tracking
-                elapsed = time.time() - self.start_time
-                parts.append(Part(
-                    text=f"<system>Elapsed time: {elapsed:.0f} seconds</system>"
-                ))
-
-                return parts
-        """
-        return []
-
-
-class AdkAssistantContextAggregator(LLMAssistantContextAggregator):
+class AdkAssistantContextAggregator(GoogleAssistantContextAggregator):
     """Handles assistant output from ADK agent.
 
     This aggregator uses Pipecat's built-in text aggregation to track what
@@ -122,7 +57,7 @@ class AdkAssistantContextAggregator(LLMAssistantContextAggregator):
         self,
         session_service,
         session_params: SessionParams,
-        context: Optional[GoogleLLMContext] = None,
+        runner: Runner
     ):
         """Initialize the assistant context aggregator.
 
@@ -131,124 +66,75 @@ class AdkAssistantContextAggregator(LLMAssistantContextAggregator):
             session_params: Session identification parameters
             context: Optional GoogleLLMContext. If not provided, creates a new one.
         """
-        super().__init__(context=context or GoogleLLMContext())
+        super().__init__(GoogleLLMContext())
         self.session_service = session_service
         self.session_params = session_params
+        self.runner = runner
+
+    async def handle_aggregation(self, aggregation: str):
+        # Google ADK already added the LLM response to the session,
+        # so we don't need to do anything here.
+        pass  # No-op: ADK manages assistant messages internally
 
     async def _handle_interruptions(self, frame: StartInterruptionFrame):
-        """Handle user interruption.
-
-        Called by Pipecat when the user interrupts the bot's speech.
-        Adds a synthetic event to the ADK session with the portion that
-        was actually heard by the user.
-
-        The InterruptionAwareRequestProcessor will filter this during
-        the next LLM request to ensure only the heard portion is included
-        in the conversation history.
-
-        Args:
-            frame: The interruption frame from Pipecat
-        """
-        # Call parent to aggregate text that was actually spoken
-        # This uses Pipecat's built-in tracking of TTSTextFrames
         await super()._handle_interruptions(frame)
-
-        # Get the aggregated text (what user actually heard before interrupting)
         spoken_text = self._aggregation
-
         if spoken_text:
-            logger.debug(
-                f"Handling interruption - spoken text: '{spoken_text[:50]}...'"
-            )
             await self._add_interruption_event(spoken_text)
-        else:
-            logger.debug("Handling interruption - no text was spoken yet")
 
     async def _add_interruption_event(self, spoken_text: str):
         """Add synthetic event to ADK session indicating interruption.
 
-        This event will be processed by InterruptionAwareRequestProcessor
-        before the next LLM request to filter the conversation history.
+        This event will be processed by InterruptionHandlerPlugin's
+        before_model_callback before the next LLM request to filter the
+        conversation history.
 
         Args:
             spoken_text: The portion of the response that was actually spoken
         """
-        try:
-            session = await self.session_service.get_session(
-                app_name=self.session_params.app_name,
-                user_id=self.session_params.user_id,
-                session_id=self.session_params.session_id,
-            )
+    
+        session = await self.session_service.get_session(
+            app_name=self.session_params.app_name,
+            user_id=self.session_params.user_id,
+            session_id=self.session_params.session_id,
+        )
 
-            # Create synthetic event indicating interruption
-            interruption_event = Event(
-                invocation_id=Event.new_id(),
-                author="system",
-                content=Content(
-                    role="user",
-                    parts=[
-                        Part(
-                            text=f"<system>Previous agent response was interrupted. "
-                            f"Only the following portion was heard by the user: "
-                            f"'{spoken_text}'</system>"
-                        )
-                    ],
-                ),
-                actions=EventActions(skip_summarization=True),
-                timestamp=time.time(),
-            )
+        # Determine which agent last responded
+        # We need this to set the correct author on the event
+        # TODO: Using private API _find_agent_to_run - consider finding public alternative
+        last_run_agent = self.runner._find_agent_to_run(session, self.runner.agent)
 
-            # Commit to ADK session
-            await self.session_service.append_event(session, interruption_event)
+        # Create synthetic event indicating interruption
+        # Wrap in <interruption> tags for reliable marker detection
+        interruption_text = f"<interruption>{spoken_text}</interruption>"
+        interruption_event = Event(
+            invocation_id=Event.new_id(),
+            author=last_run_agent.name,
+            content=Content(
+                role="user",
+                parts=[Part(text=interruption_text)],
+            ),
+            timestamp=time.time(),
+        )
 
-            logger.info(
-                f"Added interruption event to session {self.session_params.session_id}"
-            )
+        # Commit to ADK session
+        await self.session_service.append_event(session, interruption_event)
 
-        except Exception as e:
-            logger.error(
-                f"Failed to add interruption event: {e}",
-                exc_info=True,
-            )
+        logger.info(
+            f"Added interruption event to session {self.session_params.session_id}"
+        )
 
-    # Block function call frames from entering Pipecat context
+
     # ADK manages function call lifecycle internally, so we don't want
-    # these frames to pollute Pipecat's context. However, they are still
-    # pushed upstream/downstream by the LLM service to inform other
-    # processors (STTMuteFilter, UserIdleProcessor) of the lifecycle.
-
+    # these frames to pollute Pipecat's context. 
+    # 
+    # BUT we still push them upstream/downstream to inform other
+    # processors (STTMuteFilter, UserIdleProcessor).
     async def handle_function_call_in_progress(self, frame: FunctionCallInProgressFrame):
-        """Block function call frames from entering context.
-
-        ADK manages function calls internally. We intentionally skip
-        the parent implementation to prevent these frames from being
-        added to Pipecat's context.
-
-        Args:
-            frame: The function call in progress frame
-        """
         pass  # Intentionally skip super() - ADK manages function calls
 
     async def handle_function_call_result(self, frame: FunctionCallResultFrame):
-        """Block function response frames from entering context.
-
-        ADK manages function calls internally. We intentionally skip
-        the parent implementation to prevent these frames from being
-        added to Pipecat's context.
-
-        Args:
-            frame: The function call result frame
-        """
         pass  # Intentionally skip super() - ADK manages function calls
 
     async def handle_function_call_cancel(self, frame: FunctionCallCancelFrame):
-        """Block function cancel frames from entering context.
-
-        ADK manages function calls internally. We intentionally skip
-        the parent implementation to prevent these frames from being
-        added to Pipecat's context.
-
-        Args:
-            frame: The function call cancel frame
-        """
         pass  # Intentionally skip super() - ADK manages function calls
