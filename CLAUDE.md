@@ -16,17 +16,17 @@ uv sync
 
 ### Testing
 ```bash
-# Run all tests
-uv run pytest
+# Run all tests (verbose)
+uv run python -m unittest discover -s tests -v
 
-# Run with coverage
-uv run pytest --cov=pipecat_adk --cov-report=html
+# Run all tests (short form)
+uv run python -m unittest
 
 # Run specific test file
-uv run pytest tests/test_llm_service.py
+uv run python -m unittest tests.test_context_aggregator -v
 
 # Run specific test
-uv run pytest tests/test_llm_service.py::TestAdkBasedLLMService::test_initialization
+uv run python -m unittest tests.test_context_aggregator.TestContextAggregator.test_basic_interaction
 ```
 
 ### Installation
@@ -131,8 +131,8 @@ The regex pattern `r'<interruption>(.*?)</interruption>'` extracts the spoken po
 
 ## Testing Patterns
 
-### Pytest Configuration
-Tests use `asyncio_mode = "auto"` from `pyproject.toml:40`, so test functions can be async without decorators.
+### Unittest Configuration
+Tests use `unittest.IsolatedAsyncioTestCase` for async test support. Test files use absolute imports (e.g., `from tests.mocks import MockLLM`) to work properly with unittest discovery.
 
 ### Mock Patterns
 When mocking ADK agents, ensure the flow structure is present:
@@ -176,10 +176,7 @@ Core dependencies (from `pyproject.toml:12-19`):
 - `google-cloud-speech>=2.0.0`: Speech recognition
 - `loguru>=0.7.0`: Logging
 
-Dev dependencies:
-- `pytest>=8.0.0`
-- `pytest-asyncio>=0.23.0`
-- `pytest-mock>=3.12.0`
+No additional dev dependencies required - uses Python's built-in `unittest` for testing.
 
 ## Common Tasks
 
