@@ -46,7 +46,7 @@ class AdkBasedLLMService(GoogleLLMService):
         **kwargs,
     ):
 
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, api_key="does-not-matter", **kwargs)
 
         self.session_service = session_service
         self.session_params = session_params
