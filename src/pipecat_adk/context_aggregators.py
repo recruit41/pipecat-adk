@@ -9,6 +9,7 @@ from typing import Optional
 
 from google.adk.events.event import Event
 from google.adk.runners import Runner
+from google.adk.sessions.base_session_service import BaseSessionService
 from google.genai.types import Content, Part
 from loguru import logger
 from pipecat.frames.frames import (
@@ -18,7 +19,7 @@ from pipecat.frames.frames import (
     InterruptionFrame,
 )
 
-from pipecat.services.google import (
+from pipecat.services.google.llm import (
     GoogleLLMContext,
     GoogleUserContextAggregator,
     GoogleAssistantContextAggregator
@@ -28,15 +29,15 @@ from .types import SessionParams
 
 
 class AdkUserContextAggregator(GoogleUserContextAggregator):
-    def __init__(self, context: Optional[GoogleLLMContext] = None):
+    def __init__(self, context: Optional[GoogleLLMContext] = None) -> None:
         super().__init__(context=context or GoogleLLMContext())
 
-    async def handle_aggregation(self, aggregation: str):
+    async def handle_aggregation(self, aggregation: str) -> None:
         content = await self._aggregation_to_content(aggregation)
 
         # Only keep the current user input in context
         self._context.set_messages([])
-        self._context.add_message(content) # type: ignore
+        self._context.add_message(content)  # type: ignore
 
     async def _aggregation_to_content(self, aggregation: str) -> Content:
         parts = [Part(text=aggregation)]
@@ -55,28 +56,28 @@ class AdkAssistantContextAggregator(GoogleAssistantContextAggregator):
 
     def __init__(
         self,
-        session_service,
+        session_service: BaseSessionService,
         session_params: SessionParams,
         runner: Runner
-    ):
+    ) -> None:
         """Initialize the assistant context aggregator.
 
         Args:
             session_service: ADK session service for event persistence
             session_params: Session identification parameters
-            context: Optional GoogleLLMContext. If not provided, creates a new one.
+            runner: ADK runner instance
         """
         super().__init__(GoogleLLMContext())
         self.session_service = session_service
         self.session_params = session_params
         self.runner = runner
 
-    async def handle_aggregation(self, aggregation: str):
+    async def handle_aggregation(self, aggregation: str) -> None:
         # Google ADK already added the LLM response to the session,
         # so we don't need to do anything here.
         pass  # No-op: ADK manages assistant messages internally
 
-    async def _handle_interruptions(self, frame: InterruptionFrame):
+    async def _handle_interruptions(self, frame: InterruptionFrame) -> None:
         # Save the spoken text BEFORE calling super(), because super() will clear it
         spoken_text = self._aggregation
 
@@ -85,7 +86,7 @@ class AdkAssistantContextAggregator(GoogleAssistantContextAggregator):
         if spoken_text:
             await self._add_interruption_event(spoken_text)
 
-    async def _add_interruption_event(self, spoken_text: str):
+    async def _add_interruption_event(self, spoken_text: str) -> None:
         """Add synthetic event to ADK session indicating interruption.
 
         This event will be processed by InterruptionHandlerPlugin's
@@ -129,15 +130,15 @@ class AdkAssistantContextAggregator(GoogleAssistantContextAggregator):
 
 
     # ADK manages function call lifecycle internally, so we don't want
-    # these frames to pollute Pipecat's context. 
-    # 
+    # these frames to pollute Pipecat's context.
+    #
     # BUT we still push them upstream/downstream to inform other
     # processors (STTMuteFilter, UserIdleProcessor).
-    async def handle_function_call_in_progress(self, frame: FunctionCallInProgressFrame):
+    async def handle_function_call_in_progress(self, frame: FunctionCallInProgressFrame) -> None:
         pass  # Intentionally skip super() - ADK manages function calls
 
-    async def handle_function_call_result(self, frame: FunctionCallResultFrame):
+    async def handle_function_call_result(self, frame: FunctionCallResultFrame) -> None:
         pass  # Intentionally skip super() - ADK manages function calls
 
-    async def handle_function_call_cancel(self, frame: FunctionCallCancelFrame):
+    async def handle_function_call_cancel(self, frame: FunctionCallCancelFrame) -> None:
         pass  # Intentionally skip super() - ADK manages function calls

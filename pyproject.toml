@@ -8,11 +8,23 @@ authors = [
     { name = "Recruit41", email = "hello@recruit41.com" }
 ]
 license = { text = "MIT" }
+keywords = ["pipecat", "adk", "google", "voice-ai", "conversational-ai", "gemini", "real-time"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Communications :: Chat",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
 
 dependencies = [
     "pipecat-ai>=0.0.44",
-    "google-adk>=0.1.0",
-    "google-genai>=0.1.0",
+    "google-adk>=1.0.0",
+    "google-genai>=1.0.0",
     "google-cloud-texttospeech>=2.0.0",
     "google-cloud-speech>=2.0.0",
     "loguru>=0.7.0",

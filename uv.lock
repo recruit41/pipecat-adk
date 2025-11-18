@@ -1936,10 +1936,10 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "google-adk", specifier = ">=0.1.0" },
+    { name = "google-adk", specifier = ">=1.0.0" },
     { name = "google-cloud-speech", specifier = ">=2.0.0" },
     { name = "google-cloud-texttospeech", specifier = ">=2.0.0" },
-    { name = "google-genai", specifier = ">=0.1.0" },
+    { name = "google-genai", specifier = ">=1.0.0" },
     { name = "loguru", specifier = ">=0.7.0" },
     { name = "pipecat-ai", specifier = ">=0.0.44" },
 ]

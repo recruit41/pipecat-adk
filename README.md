@@ -184,25 +184,30 @@ This keeps Pipecat fully informed of the function call lifecycle without polluti
 ## Development
 
 ```bash
-# Clone repository
-cd /path/to/recruitbot
-cd pipecat-adk
-
 # Install in development mode with uv
 uv sync
 
 # Run tests
-uv run pytest
+uv run python -m unittest discover -s tests -v
 
 # Run tests with coverage
-uv run pytest --cov=pipecat_adk --cov-report=html
+uv run python -m coverage run -m unittest discover -s tests
+uv run python -m coverage report
+uv run python -m coverage html  # Generate HTML report
 ```
 
 ## Examples
 
-- [basic_chatbot.py](examples/basic_chatbot.py) - Minimal working example
-- [custom_frames.py](examples/custom_frames.py) - Extending with custom frames
-- [rtvi_integration.py](examples/rtvi_integration.py) - RTVI protocol integration
+See [examples/basic_chatbot.py](examples/basic_chatbot.py) for a complete working example showing:
+- Setting up ADK agents with Pipecat pipelines
+- Automatic interruption handling
+- Daily.co transport integration
+- Voice input/output with Google STT/TTS
+
+For advanced usage patterns, see the Extension Points section above for examples of:
+- Adding custom context to user messages
+- Handling custom application frames
+- Integrating with RTVI protocol
 
 ## License
 

@@ -8,8 +8,10 @@ from typing import Any, Optional
 
 from google.adk.agents import Agent
 from google.adk.agents.run_config import RunConfig, StreamingMode
+from google.adk.events.event import Event
 from google.adk.runners import Runner
-from google.genai.types import Content
+from google.adk.sessions.base_session_service import BaseSessionService
+from google.genai.types import Content, FunctionCall, FunctionResponse
 from loguru import logger
 from pipecat.frames.frames import (
     FunctionCallFromLLM,
@@ -21,7 +23,7 @@ from pipecat.frames.frames import (
     LLMTextFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
-from pipecat.services.google import (
+from pipecat.services.google.llm import (
     GoogleContextAggregatorPair,
     GoogleLLMContext,
     GoogleLLMService,
@@ -39,12 +41,12 @@ from .types import SessionParams
 class AdkBasedLLMService(GoogleLLMService):
     def __init__(
         self,
-        session_service,
+        session_service: BaseSessionService,
         session_params: SessionParams,
         agent: Agent,
-        *args,
-        **kwargs,
-    ):
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
 
         super().__init__(*args, api_key="does-not-matter", **kwargs)
 
@@ -66,7 +68,7 @@ class AdkBasedLLMService(GoogleLLMService):
         logger.debug("Registered InterruptionHandlerPlugin with runner")
 
     def create_context_aggregator(
-        self, *args, **kwargs
+        self, *args: Any, **kwargs: Any
     ) -> GoogleContextAggregatorPair:
         """Create ADK-aware context aggregators.
 
@@ -87,18 +89,18 @@ class AdkBasedLLMService(GoogleLLMService):
         )
 
     @traced_llm
-    async def _process_context(self, context: GoogleLLMContext):
+    async def _process_context(self, context: GoogleLLMContext) -> None:
         messages = context.get_messages()
         if not messages:
             return
 
         # Get the last message (most recent user input)
         new_message = messages[-1]
-        await self._run_adk(new_message) # type: ignore
+        await self._run_adk(new_message)  # type: ignore
 
     async def _run_adk(
         self, new_message: Content, state_delta: Optional[dict[str, Any]] = None
-    ):
+    ) -> None:
         await self.push_frame(LLMFullResponseStartFrame())
         try:
             async for event in self.runner.run_async(
@@ -120,7 +122,7 @@ class AdkBasedLLMService(GoogleLLMService):
             await self.push_frame(LLMFullResponseEndFrame())
 
 
-    async def _push_frames_from_event(self, event) -> None:
+    async def _push_frames_from_event(self, event: Event) -> None:
         """Convert ADK events to Pipecat frames.
 
         Creates standard LLMTextFrame for text content and pushes
@@ -150,7 +152,7 @@ class AdkBasedLLMService(GoogleLLMService):
             elif part.function_response:
                 await self._handle_function_response(part.function_response)
 
-    async def _handle_function_call(self, func_call):
+    async def _handle_function_call(self, func_call: FunctionCall) -> None:
         """Push function call frames to inform Pipecat of execution.
 
         Creates and pushes FunctionCallFromLLM and FunctionCallInProgressFrame
@@ -187,7 +189,7 @@ class AdkBasedLLMService(GoogleLLMService):
         await self.push_frame(function_inprogress_frame, FrameDirection.UPSTREAM)
         await self.push_frame(function_inprogress_frame, FrameDirection.DOWNSTREAM)
 
-    async def _handle_function_response(self, func_response):
+    async def _handle_function_response(self, func_response: FunctionResponse) -> None:
         """Push function response frames to inform Pipecat of completion.
 
         Creates and pushes FunctionCallResultFrame both UPSTREAM and
@@ -198,8 +200,8 @@ class AdkBasedLLMService(GoogleLLMService):
             func_response: The function response from ADK event
         """
         result_frame = FunctionCallResultFrame(
-            tool_call_id=func_response.id,
-            function_name=func_response.name,
+            tool_call_id=func_response.id or "",
+            function_name=func_response.name or "",
             arguments=None,
             result=func_response.response or {},
         )

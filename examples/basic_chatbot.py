@@ -15,9 +15,11 @@ import os
 
 from google.adk.agents import Agent
 from google.adk.sessions import InMemorySessionService
+from pipecat.frames.frames import TextFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.services.google import GoogleSTTService, GoogleTTSService
+from pipecat.services.google.stt import GoogleSTTService
+from pipecat.services.google.tts import GoogleTTSService
 from pipecat.transcriptions.language import Language
 from pipecat.transports.daily.transport import DailyParams, DailyTransport
 
@@ -125,14 +127,8 @@ async def main():
     @transport.event_handler("on_participant_joined")
     async def on_participant_joined(transport, participant):
         print(f"Participant joined: {participant['id']}")
-        # Greet the user
-        await task.queue_frames(
-            [
-                context_aggregator.user()._context.add_message(
-                    {"role": "user", "content": "<system>User joined. Greet them.</system>"}
-                )
-            ]
-        )
+        # Send a greeting prompt to the bot
+        await task.queue_frames([TextFrame("<system>User joined. Greet them.</system>")])
 
     @transport.event_handler("on_participant_left")
     async def on_participant_left(transport, participant, reason):
