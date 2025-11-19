@@ -43,7 +43,7 @@ from pipecat.frames.frames import (
     CancelFrame,
 )
 from pipecat.audio.vad.vad_analyzer import VADAnalyzer, VADParams
-from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.stt_service import STTService
 from pipecat.services.tts_service import TTSService
 from pipecat.utils.time import time_now_iso8601
@@ -571,11 +571,11 @@ class MockTransport(BaseTransport):
         self._register_event_handler("on_participant_joined")
         self._register_event_handler("on_participant_left")
 
-    def input(self) -> FrameProcessor:
+    def input(self) -> 'MockInputTransport':
         """Return the input transport."""
         return self._input_transport
 
-    def output(self) -> FrameProcessor:
+    def output(self) -> 'MockOutputTransport':
         """Return the output transport."""
         return self._output_transport
 
