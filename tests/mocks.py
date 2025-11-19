@@ -91,6 +91,25 @@ class Say:
     text: str
 
 @dataclass
+class WaitForResponse:
+    """Wait until bot finishes speaking."""
+    pass
+
+
+@dataclass
+class WaitTillBotSays:
+    """Wait until bot says specific text."""
+    text: str
+
+
+@dataclass
+class InterruptAfter:
+    """Wait until bot says specific text, then immediately speak."""
+    wait_for_text: str
+    say_text: str
+
+
+@dataclass
 class Join:
     """User joins the session (designed but not implemented yet)."""
     pass
@@ -107,7 +126,7 @@ class WaitForSomeTime:
 
 # Type alias for type hints
 UserAction = Union[
-    Say, Join, Leave, WaitForSomeTime
+    Say, WaitForResponse, WaitTillBotSays, InterruptAfter, Join, Leave, WaitForSomeTime
 ]
 
 
@@ -538,15 +557,26 @@ class MockInputTransport(BaseInputTransport):
     of actions like speaking text, waiting for bot responses, and interrupting.
     It's designed for end-to-end testing of pipecat pipelines.
 
-    Example:
+    Examples:
+        # Basic conversation with wait
         user_actions = [
             Say("Hello"),
             WaitForResponse(),
             Say("My name is John"),
-            WaitTillBotSays("position"),
+        ]
+
+        # Conditional action based on bot speech
+        user_actions = [
+            Say("I'm looking for a job"),
+            WaitTillBotSays("position"),  # Wait until bot mentions "position"
             Say("Software Engineer")
         ]
-        transport = MockInputTransport(actions=user_actions)
+
+        # Test interruption handling
+        user_actions = [
+            Say("Tell me about your company"),
+            InterruptAfter("We are a", "Actually, I have a question"),  # Interrupt mid-sentence
+        ]
     """
 
     def __init__(self, actions: Sequence[UserAction], **kwargs):
@@ -577,6 +607,12 @@ class MockInputTransport(BaseInputTransport):
 
         self._streaming_task = None
         self._parent_transport: Optional[MockTransport] = None
+
+        # Bot state tracking for wait conditions
+        self._bot_speaking = False
+        self._bot_has_spoken_this_turn = False  # Track if bot spoke during this response cycle
+        self._bot_text_buffer = ""
+        self._wait_condition = asyncio.Event()
 
     def add_actions(self, actions: List[UserAction]):
         """Add new actions to be processed dynamically.
@@ -633,6 +669,12 @@ class MockInputTransport(BaseInputTransport):
             # Process action
             if isinstance(action, Say):
                 await self._handle_say(action)
+            elif isinstance(action, WaitForResponse):
+                await self._handle_wait_for_response()
+            elif isinstance(action, WaitTillBotSays):
+                await self._handle_wait_till_bot_says(action)
+            elif isinstance(action, InterruptAfter):
+                await self._handle_interrupt_after(action)
             elif isinstance(action, Join):
                 await self._handle_join(action)
             elif isinstance(action, Leave):
@@ -661,38 +703,22 @@ class MockInputTransport(BaseInputTransport):
     async def _handle_say(self, action: Say):
         """Emit user audio frames for the given text.
 
-        Emits: silence (2 bytes) -> speech -> silence (2 bytes)
-        The MockVADAnalyzer is configured with minimal thresholds to detect
-        transitions with just 2 bytes of silence.
+        Follows the same word-based chunking logic as MockTTSService but
+        emits UserAudioRawFrame instead of TTSAudioRawFrame.
         """
         logger.debug(f"{self}: User says: [{action.text}]")
 
-        # Silence before speech - triggers VAD to start from QUIET state
-        # Need 2 frames (2 bytes each = 4 bytes total) to trigger state change
-        silence_before = UserAudioRawFrame(
-            audio=SILENCE * 4,
-            sample_rate=SAMPLE_RATE,
-            num_channels=NUM_CHANNELS
-        )
-        await self.push_audio_frame(silence_before)
+        # Split text into word-based chunks (same as MockTTSService)
+        chunks = _chunk_string(action.text)
 
-        # Speech audio
-        speech_bytes = action.text.encode("utf-8")
-        speech_frame = UserAudioRawFrame(
-            audio=speech_bytes,
-            sample_rate=SAMPLE_RATE,
-            num_channels=NUM_CHANNELS
-        )
-        await self.push_audio_frame(speech_frame)
-
-        # Silence after speech - triggers VAD SPEAKING -> QUIET transition
-        # Need 2 frames (2 bytes each = 4 bytes total) to trigger state change
-        silence_after = UserAudioRawFrame(
-            audio=SILENCE * 4,
-            sample_rate=SAMPLE_RATE,
-            num_channels=NUM_CHANNELS
-        )
-        await self.push_audio_frame(silence_after)
+        for chunk in chunks:
+            audio_bytes = chunk.encode("utf-8")
+            frame = UserAudioRawFrame(
+                audio=audio_bytes,
+                sample_rate=SAMPLE_RATE,
+                num_channels=NUM_CHANNELS
+            )
+            await self.push_audio_frame(frame)
 
     async def _emit_silence(self):
         """Emit a single silence frame for liveliness.
@@ -707,7 +733,90 @@ class MockInputTransport(BaseInputTransport):
         )
         await self.push_audio_frame(frame)
 
-    async def _handle_join(self, action: Join):
+    async def _handle_wait_for_response(self):
+        """Wait for bot's complete response cycle, emitting silence periodically.
+
+        This implements the semantic: user speaks -> wait for bot to start -> wait for bot to finish.
+        Emits silence frames every 200ms for liveliness while waiting.
+
+        Uses _bot_has_spoken_this_turn to handle race conditions where the bot starts and
+        stops speaking very quickly (within milliseconds) before we can detect it.
+        """
+        # Reset the flag for this response cycle
+        self._bot_has_spoken_this_turn = False
+
+        logger.debug(f"{self}: Waiting for bot to respond")
+
+        # First, wait for bot to START speaking at least once
+        # Use _bot_has_spoken_this_turn to handle race conditions where bot starts and stops quickly
+        while not self._bot_has_spoken_this_turn:
+            # Emit silence for liveliness
+            await self._emit_silence()
+
+            # Wait for condition change or timeout
+            try:
+                await asyncio.wait_for(self._wait_condition.wait(), timeout=0.2)
+                self._wait_condition.clear()
+            except asyncio.TimeoutError:
+                pass
+
+        # Then, wait for bot to STOP speaking (and stay stopped)
+        # Wait a bit longer to ensure all utterances are complete
+        while self._bot_speaking:
+            # Emit silence for liveliness
+            await self._emit_silence()
+
+            # Wait for condition change or timeout
+            try:
+                await asyncio.wait_for(self._wait_condition.wait(), timeout=0.2)
+                self._wait_condition.clear()
+            except asyncio.TimeoutError:
+                pass
+
+        # Extra safety: give a tiny bit more time for any final frames
+        await asyncio.sleep(0.05)
+
+        logger.debug(f"{self}: Bot finished responding")
+
+    async def _handle_wait_till_bot_says(self, action: WaitTillBotSays):
+        """Wait until bot says specific text, emitting silence periodically."""
+        logger.debug(f"{self}: Waiting for bot to say: [{action.text}]")
+
+        while action.text not in self._bot_text_buffer:
+            # Emit silence for liveliness
+            await self._emit_silence()
+
+            # Wait for condition change or timeout
+            try:
+                await asyncio.wait_for(self._wait_condition.wait(), timeout=0.2)
+                self._wait_condition.clear()
+            except asyncio.TimeoutError:
+                pass
+
+        logger.debug(f"{self}: Bot said the expected text")
+
+    async def _handle_interrupt_after(self, action: InterruptAfter):
+        """Wait for bot to say text, then immediately speak.
+
+        This combines WaitTillBotSays with Say to simulate an interruption.
+        """
+        logger.debug(f"{self}: Will interrupt after bot says: [{action.wait_for_text}]")
+
+        # First wait for bot to say the trigger text
+        while action.wait_for_text not in self._bot_text_buffer:
+            await self._emit_silence()
+            try:
+                await asyncio.wait_for(self._wait_condition.wait(), timeout=0.2)
+                self._wait_condition.clear()
+            except asyncio.TimeoutError:
+                pass
+
+        logger.debug(f"{self}: Interrupting with: [{action.say_text}]")
+
+        # Then immediately say the interruption text
+        await self._handle_say(Say(action.say_text))
+
+    async def _handle_join(self, _action: Join):
         """Handle Join action by triggering transport callbacks."""
         logger.debug(f"{self}: User joined")
         if self._parent_transport:
@@ -716,12 +825,39 @@ class MockInputTransport(BaseInputTransport):
             await self._parent_transport._call_event_handler("on_participant_joined", participant)
             await self._parent_transport._call_event_handler("on_client_connected", participant)
 
-    async def _handle_leave(self, action: Leave):
+    async def _handle_leave(self, _action: Leave):
         """Handle Leave action by triggering transport callbacks."""
         logger.debug(f"{self}: User left")
         if self._parent_transport:
             participant = {"id": "test-user", "name": "Test User"}
             await self._parent_transport._call_event_handler("on_participant_left", participant, "user_left")
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Track bot speaking state and text output.
+
+        Monitors BotStartedSpeakingFrame, BotStoppedSpeakingFrame, and
+        TTSTextFrame to maintain bot state for wait conditions.
+
+        Note: All frame propagation is handled by the base class.
+        This method only tracks mock-specific state for test coordination.
+        The base class already maintains self._bot_speaking.
+        """
+        await super().process_frame(frame, direction)
+
+        # Track bot speaking state for wait conditions
+        if isinstance(frame, BotStartedSpeakingFrame):
+            logger.debug(f"{self}: Bot started speaking")
+            self._bot_has_spoken_this_turn = True  # Mark that bot spoke during this turn
+            self._bot_text_buffer = ""  # Reset for new utterance
+            self._wait_condition.set()
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            logger.debug(f"{self}: Bot stopped speaking")
+            self._bot_text_buffer = ""  # Clear after utterance complete
+            self._wait_condition.set()
+        elif isinstance(frame, TTSTextFrame):
+            self._bot_text_buffer += frame.text
+            logger.debug(f"{self}: Bot text buffer now: [{self._bot_text_buffer}]")
+            self._wait_condition.set()
 
 
 class MockOutputTransport(BaseOutputTransport):
