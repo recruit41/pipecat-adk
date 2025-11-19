@@ -22,12 +22,12 @@ classifiers = [
 ]
 
 dependencies = [
-    "pipecat-ai>=0.0.44",
-    "google-adk>=1.0.0",
-    "google-genai>=1.0.0",
-    "google-cloud-texttospeech>=2.0.0",
-    "google-cloud-speech>=2.0.0",
-    "loguru>=0.7.0",
+    "pipecat-ai>=0.0.94",
+    "google-adk>=1.18.0",
+    "google-genai>=1.51.0",
+    "google-cloud-texttospeech>=2.33.0",
+    "google-cloud-speech>=2.34.0",
+    "loguru>=0.7.3",
 ]
 
 [build-system]
