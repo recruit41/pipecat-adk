@@ -140,10 +140,13 @@ class AdkBasedLLMService(GoogleLLMService):
         if not event.content or not event.content.parts:
             return
 
-        # Convert text to standard LLMTextFrame (no custom frames needed)
-        text = "".join([part.text for part in event.content.parts if part.text])
-        if text:
-            await self.push_frame(LLMTextFrame(text=text))
+        if event.partial:
+            # Since we are in streaming mode, we receive partial text events
+            # Only partial events are pushed to Pipecat as LLMTextFrame
+            # The final response is discarded because it is a repetition
+            text = "".join([part.text for part in event.content.parts if part.text])
+            if text:
+                await self.push_frame(LLMTextFrame(text=text))
 
         # Handle function calls - keep Pipecat informed of lifecycle
         for part in event.content.parts:
