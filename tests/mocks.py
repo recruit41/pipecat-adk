@@ -14,8 +14,7 @@
 import asyncio
 import re
 from dataclasses import dataclass
-from typing import AsyncGenerator, List, Sequence, Union, Optional
-from typing import AsyncGenerator, List
+from typing import AsyncGenerator, List, Optional, Sequence, Union
 from typing_extensions import override
 
 from google.adk.events import Event
@@ -61,7 +60,7 @@ from pipecat_adk import AdkBasedLLMService, SessionParams
 
 # Constants for mock services
 SILENCE = b'\x00'
-SAMPLE_RATE = 16000
+SAMPLE_RATE = 16000  # Standard sample rate for testing
 NUM_CHANNELS = 1
 
 def _chunk_string(s: str) -> list[str]:
@@ -128,6 +127,78 @@ class WaitForSomeTime:
 UserAction = Union[
     Say, WaitForResponse, WaitTillBotSays, InterruptAfter, Join, Leave, WaitForSomeTime
 ]
+
+
+# ============================================================================
+# BotOutputTracker - Shared state between Input/Output transports
+# ============================================================================
+
+class BotOutputTracker:
+    """Tracks bot output (speech and messages) for test coordination.
+
+    This class represents what the user sees/hears from the bot. It's shared
+    between MockOutputTransport (which writes to it) and MockInputTransport
+    (which reads from it). This mimics real transport behavior where output
+    goes through a channel (network, audio device, etc.).
+    """
+
+    def __init__(self):
+        self._accumulated_speech = ""
+        self._is_speaking = False
+        self._lock = asyncio.Lock()
+        self._speech_changed = asyncio.Event()
+
+        # For debugging
+        self._all_speech_chunks: List[str] = []
+        self._all_messages: List[Frame] = []
+
+    async def append_speech(self, text: str):
+        """Called by MockOutputTransport when speech is written."""
+        async with self._lock:
+            self._accumulated_speech += text
+            self._all_speech_chunks.append(text)
+            if not self._is_speaking and text:
+                self._is_speaking = True
+            self._speech_changed.set()
+            logger.debug(f"BotOutputTracker: Appended speech [{text}], total: [{self._accumulated_speech}]")
+
+    async def mark_speaking_started(self):
+        """Called when bot starts speaking."""
+        async with self._lock:
+            self._is_speaking = True
+            self._speech_changed.set()
+
+    async def mark_speaking_stopped(self):
+        """Called when bot stops speaking."""
+        async with self._lock:
+            self._is_speaking = False
+            self._speech_changed.set()
+
+    async def add_message(self, frame: Frame):
+        """Called by MockOutputTransport when a message is sent."""
+        async with self._lock:
+            self._all_messages.append(frame)
+            self._speech_changed.set()
+
+    def last_bot_speech(self) -> str:
+        """Get all accumulated bot speech so far."""
+        return self._accumulated_speech
+
+    def is_bot_speaking(self) -> bool:
+        """Check if bot is currently speaking."""
+        return self._is_speaking
+
+    async def wait_for_speech_change(self, timeout: float = 0.2):
+        """Wait for speech state to change (for synchronization)."""
+        try:
+            await asyncio.wait_for(self._speech_changed.wait(), timeout=timeout)
+            self._speech_changed.clear()
+        except asyncio.TimeoutError:
+            pass
+
+    def get_all_messages(self) -> List[Frame]:
+        """Get all messages for debugging."""
+        return self._all_messages[:]
 
 
 class MockLLM(BaseLlm):
@@ -339,7 +410,7 @@ class MockLLM(BaseLlm):
                     for chunk in chunks:
                         chunk_content = Content(role="model", parts=[Part.from_text(text=chunk)])
                         yield LlmResponse(content=chunk_content, partial=True)
-                    
+
                     # Now yield the entire text as final
                     final_content = Content(role="model", parts=[part])
                     yield LlmResponse(content=final_content, partial=None)
@@ -369,12 +440,10 @@ class TestRunner:
         )
         self.session_service = InMemorySessionService()
 
-        self.mock_input = MockInputTransport(actions=[])
-        self.mock_output = MockOutputTransport()
-        self.transport = MockTransport(
-            input_transport=self.mock_input,
-            output_transport=self.mock_output
-        )
+        # MockTransport creates and connects input/output transports with shared tracker
+        self.transport = MockTransport(input_actions=[])
+        self.mock_input = self.transport.input()
+        self.mock_output = self.transport.output()
         adk_service = AdkBasedLLMService(
             session_service=self.session_service,
             session_params=self.session_params,
@@ -386,9 +455,9 @@ class TestRunner:
             MockSTTService(),
             context_aggregators.user(),
             adk_service,
-            context_aggregators.assistant(),
             MockTTSService(),
             self.mock_output,
+            context_aggregators.assistant(),  # MUST be after output transport
         ])
         self.task = None
         self.runner = None
@@ -407,23 +476,15 @@ class TestRunner:
     
     
     async def run(self, user_actions: List[UserAction], timeout: float = 0.5) -> "BotResponse":
-        session = await self.session_service.create_session(
-            **self.session_params.model_dump()
-        )
-        assert session is not None
-
         if self.task is None:
             # First run - start pipeline
-            self.task = PipelineTask(self.pipeline, observers=[DebugLogObserver()]) 
+            self.task = PipelineTask(self.pipeline, observers=[DebugLogObserver()])
             self.runner = PipelineRunner()
             self._pipeline_task = asyncio.create_task(
                 self.runner.run(self.task)
             )
             # Give pipeline time to start
             await asyncio.sleep(0.1)
-
-        # Clear previous frames for clean assertions
-        self.mock_output.clear_frames()
 
         # Add new actions to transport
         self.mock_input.add_actions(user_actions)
@@ -432,8 +493,8 @@ class TestRunner:
         # In production, could use more sophisticated synchronization
         await asyncio.sleep(timeout)
 
-        # Return collected frames wrapped in BotResponse for easier assertions
-        return BotResponse(self.mock_output.get_frames())
+        # Return BotResponse with snapshot of what was actually sent to client
+        return BotResponse(self.transport._bot_output_tracker)
 
     async def cleanup(self):
         """Clean up resources."""
@@ -450,6 +511,11 @@ class TestRunner:
 
         Creates all necessary database records before the test starts.
         """
+        # Create session before pipeline starts
+        session = await self.session_service.create_session(
+            **self.session_params.model_dump()
+        )
+        assert session is not None
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -463,18 +529,41 @@ class MockTransport(BaseTransport):
 
     This transport connects MockInputTransport and MockOutputTransport,
     and provides event handler registration for testing transport callbacks.
+
+    The transport creates a shared BotOutputTracker that represents the
+    communication channel between bot (output) and user (input). Everything
+    written by MockOutputTransport is tracked here, and MockInputTransport
+    reads from it to simulate what the user sees/hears.
     """
 
     def __init__(
         self,
-        input_transport: Optional['MockInputTransport'] = None,
-        output_transport: Optional['MockOutputTransport'] = None,
+        input_actions: Sequence[UserAction] = [],
         *args,
         **kwargs
     ):
+        """Initialize MockTransport with input/output transports.
+
+        Args:
+            input_actions: Initial sequence of UserAction instances for the input transport.
+            *args, **kwargs: Additional arguments passed to BaseTransport.
+        """
         super().__init__(*args, **kwargs)
-        self._input_transport = input_transport
-        self._output_transport = output_transport
+
+        # Create shared tracker for bot output (speech and messages)
+        # This represents what actually reaches the user
+        self._bot_output_tracker = BotOutputTracker()
+
+        # Create input and output transports with required dependencies
+        self._input_transport = MockInputTransport(
+            actions=input_actions,
+            parent_transport=self,
+            bot_output_tracker=self._bot_output_tracker
+        )
+        self._output_transport = MockOutputTransport(
+            parent_transport=self,
+            bot_output_tracker=self._bot_output_tracker
+        )
 
         # Register transport events (similar to DailyTransport)
         self._register_event_handler("on_client_connected")
@@ -482,20 +571,12 @@ class MockTransport(BaseTransport):
         self._register_event_handler("on_participant_joined")
         self._register_event_handler("on_participant_left")
 
-        # Link this transport to input/output if provided
-        if self._input_transport:
-            self._input_transport._parent_transport = self
-        if self._output_transport:
-            self._output_transport._parent_transport = self
-
     def input(self) -> FrameProcessor:
-        if not self._input_transport:
-            raise ValueError("MockTransport requires input_transport")
+        """Return the input transport."""
         return self._input_transport
 
     def output(self) -> FrameProcessor:
-        if not self._output_transport:
-            raise ValueError("MockTransport requires output_transport")
+        """Return the output transport."""
         return self._output_transport
 
     async def start_recording(self):
@@ -579,11 +660,19 @@ class MockInputTransport(BaseInputTransport):
         ]
     """
 
-    def __init__(self, actions: Sequence[UserAction], **kwargs):
+    def __init__(
+        self,
+        actions: Sequence[UserAction],
+        parent_transport: 'MockTransport',
+        bot_output_tracker: BotOutputTracker,
+        **kwargs
+    ):
         """Initialize the mock input transport with user actions.
 
         Args:
             actions: Sequence of UserAction instances to execute sequentially.
+            parent_transport: The parent MockTransport that owns this input transport.
+            bot_output_tracker: Shared tracker for bot output (speech and messages).
             **kwargs: Additional arguments passed to BaseInputTransport.
         """
         # Create TransportParams with audio enabled
@@ -606,13 +695,8 @@ class MockInputTransport(BaseInputTransport):
             self._action_queue.put_nowait(action)
 
         self._streaming_task = None
-        self._parent_transport: Optional[MockTransport] = None
-
-        # Bot state tracking for wait conditions
-        self._bot_speaking = False
-        self._bot_has_spoken_this_turn = False  # Track if bot spoke during this response cycle
-        self._bot_text_buffer = ""
-        self._wait_condition = asyncio.Event()
+        self._parent_transport: MockTransport = parent_transport
+        self._bot_output_tracker: BotOutputTracker = bot_output_tracker
 
     def add_actions(self, actions: List[UserAction]):
         """Add new actions to be processed dynamically.
@@ -739,42 +823,38 @@ class MockInputTransport(BaseInputTransport):
         This implements the semantic: user speaks -> wait for bot to start -> wait for bot to finish.
         Emits silence frames every 200ms for liveliness while waiting.
 
-        Uses _bot_has_spoken_this_turn to handle race conditions where the bot starts and
-        stops speaking very quickly (within milliseconds) before we can detect it.
+        Uses the BotOutputTracker to check if bot has spoken and if it's still speaking.
         """
-        # Reset the flag for this response cycle
-        self._bot_has_spoken_this_turn = False
-
         logger.debug(f"{self}: Waiting for bot to respond")
 
-        # First, wait for bot to START speaking at least once
-        # Use _bot_has_spoken_this_turn to handle race conditions where bot starts and stops quickly
-        while not self._bot_has_spoken_this_turn:
+        # Track the initial speech length to detect when bot starts
+        initial_speech_len = len(self._bot_output_tracker.last_bot_speech())
+
+        # First, wait for bot to START speaking (speech length increases)
+        while len(self._bot_output_tracker.last_bot_speech()) == initial_speech_len:
             # Emit silence for liveliness
             await self._emit_silence()
 
-            # Wait for condition change or timeout
-            try:
-                await asyncio.wait_for(self._wait_condition.wait(), timeout=0.2)
-                self._wait_condition.clear()
-            except asyncio.TimeoutError:
-                pass
+            # Wait for speech change or timeout
+            await self._bot_output_tracker.wait_for_speech_change(timeout=0.2)
 
-        # Then, wait for bot to STOP speaking (and stay stopped)
-        # Wait a bit longer to ensure all utterances are complete
-        while self._bot_speaking:
+        # Then, wait for bot to STOP speaking (no new speech for a while)
+        # We consider bot done when speech doesn't change for 0.5s
+        last_speech = self._bot_output_tracker.last_bot_speech()
+        stable_count = 0
+        while stable_count < 2:  # Need 2 consecutive stable checks (~0.4s)
             # Emit silence for liveliness
             await self._emit_silence()
 
-            # Wait for condition change or timeout
-            try:
-                await asyncio.wait_for(self._wait_condition.wait(), timeout=0.2)
-                self._wait_condition.clear()
-            except asyncio.TimeoutError:
-                pass
+            # Wait a bit
+            await self._bot_output_tracker.wait_for_speech_change(timeout=0.2)
 
-        # Extra safety: give a tiny bit more time for any final frames
-        await asyncio.sleep(0.05)
+            current_speech = self._bot_output_tracker.last_bot_speech()
+            if current_speech == last_speech:
+                stable_count += 1
+            else:
+                stable_count = 0
+                last_speech = current_speech
 
         logger.debug(f"{self}: Bot finished responding")
 
@@ -782,16 +862,16 @@ class MockInputTransport(BaseInputTransport):
         """Wait until bot says specific text, emitting silence periodically."""
         logger.debug(f"{self}: Waiting for bot to say: [{action.text}]")
 
-        while action.text not in self._bot_text_buffer:
+        while True:
+            # Check if bot has said the expected text
+            if action.text in self._bot_output_tracker.last_bot_speech():
+                break
+
             # Emit silence for liveliness
             await self._emit_silence()
 
-            # Wait for condition change or timeout
-            try:
-                await asyncio.wait_for(self._wait_condition.wait(), timeout=0.2)
-                self._wait_condition.clear()
-            except asyncio.TimeoutError:
-                pass
+            # Wait for speech change or timeout
+            await self._bot_output_tracker.wait_for_speech_change(timeout=0.2)
 
         logger.debug(f"{self}: Bot said the expected text")
 
@@ -803,13 +883,13 @@ class MockInputTransport(BaseInputTransport):
         logger.debug(f"{self}: Will interrupt after bot says: [{action.wait_for_text}]")
 
         # First wait for bot to say the trigger text
-        while action.wait_for_text not in self._bot_text_buffer:
+        while True:
+            # Check if bot has said the trigger text
+            if action.wait_for_text in self._bot_output_tracker.last_bot_speech():
+                break
+
             await self._emit_silence()
-            try:
-                await asyncio.wait_for(self._wait_condition.wait(), timeout=0.2)
-                self._wait_condition.clear()
-            except asyncio.TimeoutError:
-                pass
+            await self._bot_output_tracker.wait_for_speech_change(timeout=0.2)
 
         logger.debug(f"{self}: Interrupting with: [{action.say_text}]")
 
@@ -819,81 +899,103 @@ class MockInputTransport(BaseInputTransport):
     async def _handle_join(self, _action: Join):
         """Handle Join action by triggering transport callbacks."""
         logger.debug(f"{self}: User joined")
-        if self._parent_transport:
-            # Simulate participant joining - pass a mock participant object
-            participant = {"id": "test-user", "name": "Test User"}
-            await self._parent_transport._call_event_handler("on_participant_joined", participant)
-            await self._parent_transport._call_event_handler("on_client_connected", participant)
+        # Simulate participant joining - pass a mock participant object
+        participant = {"id": "test-user", "name": "Test User"}
+        await self._parent_transport._call_event_handler("on_participant_joined", participant)
+        await self._parent_transport._call_event_handler("on_client_connected", participant)
 
     async def _handle_leave(self, _action: Leave):
         """Handle Leave action by triggering transport callbacks."""
         logger.debug(f"{self}: User left")
-        if self._parent_transport:
-            participant = {"id": "test-user", "name": "Test User"}
-            await self._parent_transport._call_event_handler("on_participant_left", participant, "user_left")
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        """Track bot speaking state and text output.
-
-        Monitors BotStartedSpeakingFrame, BotStoppedSpeakingFrame, and
-        TTSTextFrame to maintain bot state for wait conditions.
-
-        Note: All frame propagation is handled by the base class.
-        This method only tracks mock-specific state for test coordination.
-        The base class already maintains self._bot_speaking.
-        """
-        await super().process_frame(frame, direction)
-
-        # Track bot speaking state for wait conditions
-        if isinstance(frame, BotStartedSpeakingFrame):
-            logger.debug(f"{self}: Bot started speaking")
-            self._bot_has_spoken_this_turn = True  # Mark that bot spoke during this turn
-            self._bot_text_buffer = ""  # Reset for new utterance
-            self._wait_condition.set()
-        elif isinstance(frame, BotStoppedSpeakingFrame):
-            logger.debug(f"{self}: Bot stopped speaking")
-            self._bot_text_buffer = ""  # Clear after utterance complete
-            self._wait_condition.set()
-        elif isinstance(frame, TTSTextFrame):
-            self._bot_text_buffer += frame.text
-            logger.debug(f"{self}: Bot text buffer now: [{self._bot_text_buffer}]")
-            self._wait_condition.set()
+        participant = {"id": "test-user", "name": "Test User"}
+        await self._parent_transport._call_event_handler("on_participant_left", participant, "user_left")
 
 
 class MockOutputTransport(BaseOutputTransport):
-    """Mock output transport that records frames using the default media sender."""
+    """Mock output transport that uses only contract methods.
 
-    def __init__(self, **kwargs):
+    This transport uses ONLY the public contract methods (write_audio_frame,
+    send_message) to track what's sent to the user. It does NOT override
+    process_frame to peek at internal frame flow.
+
+    Everything written via these methods is tracked in the shared
+    BotOutputTracker, which MockInputTransport can read from.
+    """
+
+    def __init__(
+        self,
+        parent_transport: 'MockTransport',
+        bot_output_tracker: BotOutputTracker,
+        **kwargs
+    ):
+        """Initialize the mock output transport.
+
+        Args:
+            parent_transport: The parent MockTransport that owns this output transport.
+            bot_output_tracker: Shared tracker for bot output (speech and messages).
+            **kwargs: Additional arguments passed to BaseOutputTransport.
+        """
         params = TransportParams(
             audio_out_enabled=True,
             audio_out_sample_rate=SAMPLE_RATE,
         )
         super().__init__(params=params, **kwargs)
-        self._parent_transport: Optional[MockTransport] = None
-        self._frames: List[Frame] = []
+        self._parent_transport: MockTransport = parent_transport
+        self._bot_output_tracker: BotOutputTracker = bot_output_tracker
 
     async def start(self, frame: StartFrame):
-        """Initialize base transport and register default media sender."""
+        """Initialize base transport."""
         await super().start(frame)
+        # set_transport_ready() automatically creates the MediaSender
         await self.set_transport_ready(frame)
 
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Process frames - handle audio frames directly for mock testing.
+
+        This bypasses the MediaSender for our mock UTF-8 audio because:
+        1. Our UTF-8 text bytes aren't real PCM audio
+        2. The MediaSender's async buffering/chunking adds complexity for testing
+        3. Direct processing is simpler for test scenarios
+        """
+        if isinstance(frame, TTSAudioRawFrame):
+            # Directly handle audio frame - decode UTF-8 and track speech
+            if hasattr(frame, 'audio') and frame.audio:
+                try:
+                    # Decode UTF-8 audio back to text
+                    text = frame.audio.decode('utf-8')
+
+                    # Filter out silence/empty frames
+                    if text and text != '\x00' and not all(c == '\x00' for c in text):
+                        logger.debug(f"{self}: Writing bot speech: [{text}]")
+                        await self._bot_output_tracker.append_speech(text)
+                except UnicodeDecodeError:
+                    # Skip frames that aren't UTF-8 text (silence, etc.)
+                    logger.debug(f"{self}: Skipping non-UTF8 frame")
+                    pass
+
+            await self.push_frame(frame, direction)
+        else:
+            await super().process_frame(frame, direction)
+
     async def write_audio_frame(self, frame: Frame) -> bool:
-        """Record audio frames and signal success."""
-        self._frames.append(frame)
+        """Write audio frame to output (contract method).
+
+        Audio processing is handled in process_frame, so this just returns True.
+        """
         return True
 
     async def write_video_frame(self, frame: Frame) -> bool:
-        """Record video frames and signal success."""
-        self._frames.append(frame)
+        """Write video frame (no-op for audio-only tests)."""
         return True
 
-    def get_frames(self) -> List[Frame]:
-        """Get all collected frames since the last clear."""
-        return self._frames.copy()
+    async def send_message(self, frame: Frame):
+        """Send transport message to client (contract method).
 
-    def clear_frames(self):
-        """Clear recorded frames."""
-        self._frames.clear()
+        This is called when the transport wants to send a message to the client.
+        We track it in BotOutputTracker.
+        """
+        logger.debug(f"{self}: send_message called with {type(frame).__name__}")
+        await self._bot_output_tracker.add_message(frame)
 
 
 class MockTTSService(TTSService):
@@ -1032,28 +1134,22 @@ class MockSTTService(STTService):
 
 
 class BotResponse:
-    """Wrapper around bot output frames for easier test assertions.
+    """Wrapper around bot output for easier test assertions.
+
+    Uses BotOutputTracker to get what was actually sent to the client.
+    This is a snapshot of the tracker's state at a point in time.
     """
 
-    def __init__(self, frames: List[Frame]):
-        self._frames = frames
-        self._text_frames: List[TTSTextFrame] = self._extract_text_frames()
-
-    def _extract_text_frames(self) -> List[TTSTextFrame]:
-        """Extract all TTS text frames."""
-        return [f for f in self._frames if isinstance(f, TTSTextFrame)]
+    def __init__(self, tracker: BotOutputTracker):
+        self._tracker = tracker
+        self._spoken_text = tracker.last_bot_speech()
 
     # === TEXT/SPEECH ===
 
     @property
     def text(self) -> str:
-        """All spoken text concatenated with spaces."""
-        return " ".join(f.text for f in self._text_frames)
-
-    @property
-    def text_frames(self) -> List[TTSTextFrame]:
-        """All TTS text frames in order."""
-        return self._text_frames
+        """All spoken text (decoded from audio frames)."""
+        return self._spoken_text
 
     def said(self, text: str, case_sensitive: bool = False) -> bool:
         """Check if bot said something containing this text.
@@ -1072,19 +1168,20 @@ class BotResponse:
     # === DEBUGGING ===
 
     @property
-    def all_frames(self) -> List[Frame]:
-        """All raw frames for advanced assertions."""
-        return self._frames
+    def all_messages(self) -> List[Frame]:
+        """All transport messages for debugging."""
+        return self._tracker.get_all_messages()
 
     def debug_dump(self) -> str:
-        """Return formatted string showing all frames (for debugging failing tests)."""
+        """Return formatted string showing bot output (for debugging failing tests)."""
+        messages = self.all_messages
         lines = ["=== BotResponse Debug Dump ==="]
-        lines.append(f"Total frames: {len(self._frames)}")
+        lines.append(f"Total messages: {len(messages)}")
         lines.append(f"\nSpoken text: {self.text!r}")
-        lines.append(f"\nAll frame types:")
-        for frame in self._frames:
-            lines.append(f"  - {type(frame).__name__}")
+        lines.append(f"\nMessage types:")
+        for msg in messages:
+            lines.append(f"  - {type(msg).__name__}")
         return "\n".join(lines)
 
     def __repr__(self) -> str:
-        return f"<BotResponse: {len(self._frames)} frames, text={self.text!r}>"
+        return f"<BotResponse: text={self.text!r}>"
