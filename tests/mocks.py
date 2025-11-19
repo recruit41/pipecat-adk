@@ -56,7 +56,7 @@ from pipecat.pipeline.task import PipelineTask
 from pipecat.pipeline.runner import PipelineRunner
 
 from google.adk.sessions import InMemorySessionService
-from google.adk.agents import Agent
+from google.adk.apps import App
 from pipecat_adk import AdkBasedLLMService, SessionParams
 
 # Constants for mock services
@@ -360,7 +360,7 @@ class TestRunner:
 
     def __init__(
         self,
-        agent: Agent
+        app: App
     ):
         self.session_params = SessionParams(
             app_name="agents",
@@ -378,7 +378,7 @@ class TestRunner:
         adk_service = AdkBasedLLMService(
             session_service=self.session_service,
             session_params=self.session_params,
-            agent=agent
+            app=app
         )
         context_aggregators = adk_service.create_context_aggregator()
         self.pipeline = Pipeline([
