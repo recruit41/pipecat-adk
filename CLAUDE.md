@@ -58,15 +58,17 @@ The library has 5 main components that work together:
    - Blocks function call frames from polluting Pipecat context (ADK manages these)
 
 4. **InterruptionHandlerPlugin** (`plugin.py`):
+   - Exported publicly for client developers to include in their ADK App
    - ADK plugin that implements `before_model_callback` (official ADK pattern)
    - Runs automatically before every LLM request
    - Detects synthetic interruption events in conversation history
    - Filters out full interrupted responses, replacing with only spoken portions
    - Ensures LLM only sees what user actually heard
+   - **MUST be included in the App's plugins list for proper interruption handling**
 
 5. **AdkBasedLLMService** (`llm_service.py`):
    - Main service that replaces GoogleLLMService
-   - Creates and registers InterruptionHandlerPlugin with runner
+   - Accepts an ADK App (not individual agent and plugins)
    - Invokes ADK agents via `runner.run_async()`
    - Converts ADK events to Pipecat frames
    - Pushes function call frames UPSTREAM and DOWNSTREAM to keep all processors informed
@@ -168,13 +170,13 @@ The plugin uses fuzzy substring matching to verify that interrupted text is part
 
 ## Dependencies
 
-Core dependencies (from `pyproject.toml:12-19`):
-- `pipecat-ai>=0.0.44`: Real-time audio/video pipeline framework
-- `google-adk>=0.1.0`: Google Agent Development Kit
-- `google-genai>=0.1.0`: Google Generative AI SDK
-- `google-cloud-texttospeech>=2.0.0`: Text-to-speech
-- `google-cloud-speech>=2.0.0`: Speech recognition
-- `loguru>=0.7.0`: Logging
+Core dependencies (from `pyproject.toml:24-31`):
+- `pipecat-ai>=0.0.94`: Real-time audio/video pipeline framework
+- `google-adk>=1.18.0`: Google Agent Development Kit (with App support)
+- `google-genai>=1.51.0`: Google Generative AI SDK
+- `google-cloud-texttospeech>=2.33.0`: Text-to-speech
+- `google-cloud-speech>=2.34.0`: Speech recognition
+- `loguru>=0.7.3`: Logging
 
 No additional dev dependencies required - uses Python's built-in `unittest` for testing.
 
@@ -192,15 +194,68 @@ No additional dev dependencies required - uses Python's built-in `unittest` for 
 3. Verify plugin is registered with runner in `AdkBasedLLMService.__init__`
 4. Verify spoken text is being tracked by Pipecat aggregation
 
+### Basic Usage Pattern
+
+The library requires you to create an ADK App with InterruptionHandlerPlugin:
+
+```python
+from google.adk.agents import Agent
+from google.adk.apps.app import App
+from pipecat_adk import AdkBasedLLMService, SessionParams, InterruptionHandlerPlugin
+from google.adk.sessions import InMemorySessionService
+
+# 1. Create your ADK agent
+agent = Agent(
+    name="my_agent",
+    model="gemini-2.5-flash",
+    instruction="You are a helpful assistant.",
+)
+
+# 2. Create ADK App with InterruptionHandlerPlugin
+# IMPORTANT: InterruptionHandlerPlugin is required for proper interruption handling
+app = App(
+    name="my_app",
+    root_agent=agent,
+    plugins=[InterruptionHandlerPlugin()],  # Required!
+)
+
+# 3. Create session service
+session_service = InMemorySessionService()
+session_params = SessionParams(
+    app_name=app.name,
+    user_id="user_123",
+    session_id="session_456",
+)
+await session_service.create_session(**session_params.model_dump())
+
+# 4. Create LLM service with the App
+llm = AdkBasedLLMService(
+    session_service=session_service,
+    session_params=session_params,
+    app=app,  # Pass the App, not the agent
+)
+```
+
+### Example: See `examples/assistant/agent.py`
+
+The `examples/assistant/` directory demonstrates the recommended pattern:
+
+- `agent.py`: Defines the ADK `Agent`, `App`, and includes `InterruptionHandlerPlugin`
+- `bot.py`: Imports the `app` from `agent.py` and uses it with `AdkBasedLLMService`
+- `run.py`: Entry point that starts the WebRTC server
+
+This separation keeps agent configuration separate from runtime logic.
+
 ### Adding Support for New ADK Session Services
-The library works with ANY ADK session service. Just pass it to `AdkBasedLLMService`:
+
+The library works with ANY ADK session service. Just pass it when creating `AdkBasedLLMService`:
+
 ```python
 from custom_session_service import MySessionService
 
 llm = AdkBasedLLMService(
     session_service=MySessionService(),  # Any ADK session service
     session_params=SessionParams(...),
-    agent=agent,
-    api_key=api_key
+    app=app,  # App with InterruptionHandlerPlugin
 )
 ```

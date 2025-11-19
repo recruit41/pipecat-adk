@@ -1,0 +1,7 @@
+python-dotenv
+fastapi[all]
+uvicorn
+pipecat-ai[google,silero,webrtc]
+pipecat-ai-small-webrtc-prebuilt
+google-adk
+loguru
