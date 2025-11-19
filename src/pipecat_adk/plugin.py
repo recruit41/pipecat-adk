@@ -5,6 +5,7 @@ to the model, enabling features like interruption handling using ADK's
 official plugin pattern with before_model_callback.
 """
 
+import difflib
 import re
 from typing import Optional
 
@@ -76,6 +77,15 @@ class InterruptionHandlerPlugin(BasePlugin):
         return None
 
     def _process_interruptions(self, contents: list[Content]) -> bool:
+        # Capture original state for diff logging
+        original_contents = [
+            {
+                'role': c.role,
+                'text': self._get_content_text(c)
+            }
+            for c in contents
+        ]
+
         modified = False
         new_contents = []
 
@@ -133,6 +143,10 @@ class InterruptionHandlerPlugin(BasePlugin):
                 # No interruption marker, copy content as-is
                 new_contents.append(content)
 
+        # Log summary of changes if modifications were made
+        if modified:
+            self._log_content_diff(original_contents, new_contents)
+
         # Replace the original contents with the new list
         contents[:] = new_contents
         return modified
@@ -187,3 +201,32 @@ class InterruptionHandlerPlugin(BasePlugin):
             )
 
         return is_match
+
+    def _log_content_diff(self, original: list[dict], new: list) -> None:
+        """Log a concise summary of changes made to LLM request contents."""
+        # Convert to string representations for diffing
+        def format_content(c):
+            if isinstance(c, dict):
+                text = c['text'].replace('\n', ' ')
+                return f"[{c['role']}] {text}"
+            else:
+                text = self._get_content_text(c).replace('\n', ' ')
+                return f"[{c.role}] {text}"
+
+        original_lines = [format_content(c) for c in original]
+        new_lines = [format_content(c) for c in new]
+
+        diff = '\n'.join(difflib.unified_diff(
+            original_lines,
+            new_lines,
+            fromfile='before',
+            tofile='after',
+            lineterm='',
+            n=3
+        ))
+
+        # Log the diff directly
+        if diff:
+            logger.info(f"Interruption handling modified LLM request:\n{diff}")
+        else:
+            logger.info("Interruption handling: No changes to LLM request")
