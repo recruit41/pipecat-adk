@@ -8,7 +8,7 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     LLMTextFrame,
-    TTSTextFrame, 
+    TTSTextFrame,
     InterruptionFrame
 )
 from pipecat.utils.time import time_now_iso8601
@@ -16,8 +16,9 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.tests.utils import run_test, SleepFrame
 from tests.mocks import MockLLM
 from tests.test_utils import simplify_events
-from pipecat_adk import AdkBasedLLMService, SessionParams
+from pipecat_adk import AdkBasedLLMService, SessionParams, InterruptionHandlerPlugin
 from google.adk.agents import Agent
+from google.adk.apps.app import App
 from google.adk.sessions import InMemorySessionService
 
 class TestContextAggregator(unittest.IsolatedAsyncioTestCase):
@@ -38,10 +39,15 @@ class TestContextAggregator(unittest.IsolatedAsyncioTestCase):
             model=mock_llm
         )
 
+        app = App(
+            name=session_params.app_name,
+            root_agent=agent,
+            plugins=[InterruptionHandlerPlugin()],
+        )
         adk_service = AdkBasedLLMService(
             session_service=session_service,
             session_params=session_params,
-            agent=agent
+            app=app
         )
         context_aggregators = adk_service.create_context_aggregator()
         pipeline = Pipeline([

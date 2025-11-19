@@ -11,8 +11,9 @@ from pipecat.tests.utils import run_test, SleepFrame
 from google.genai.types import Part
 from tests.mocks import MockLLM
 from tests.test_utils import simplify_events
-from pipecat_adk import AdkBasedLLMService, SessionParams
+from pipecat_adk import AdkBasedLLMService, SessionParams, InterruptionHandlerPlugin
 from google.adk.agents import Agent
+from google.adk.apps.app import App
 from google.adk.sessions import InMemorySessionService
 
 
@@ -30,6 +31,14 @@ class TestAdkBasedLLMService(unittest.IsolatedAsyncioTestCase):
         )
         await self.session_service.create_session(**self.session_params.model_dump())
 
+    def create_app(self, agent: Agent) -> App:
+        """Helper to create an App with InterruptionHandlerPlugin."""
+        return App(
+            name=self.session_params.app_name,
+            root_agent=agent,
+            plugins=[InterruptionHandlerPlugin()],
+        )
+
     async def test_basic_text_response(self):
         """Test that basic text responses are converted to events in ADK session."""
         mock_llm = MockLLM.single("Hello, how can I help you?")
@@ -39,10 +48,11 @@ class TestAdkBasedLLMService(unittest.IsolatedAsyncioTestCase):
             model=mock_llm
         )
 
+        app = self.create_app(agent)
         adk_service = AdkBasedLLMService(
             session_service=self.session_service,
             session_params=self.session_params,
-            agent=agent
+            app=app
         )
         context_aggregators = adk_service.create_context_aggregator()
         pipeline = Pipeline([
@@ -87,10 +97,11 @@ class TestAdkBasedLLMService(unittest.IsolatedAsyncioTestCase):
             model=mock_llm
         )
 
+        app = self.create_app(agent)
         adk_service = AdkBasedLLMService(
             session_service=self.session_service,
             session_params=self.session_params,
-            agent=agent
+            app=app
         )
         context_aggregators = adk_service.create_context_aggregator()
         pipeline = Pipeline([
@@ -159,10 +170,11 @@ class TestAdkBasedLLMService(unittest.IsolatedAsyncioTestCase):
             tools=[get_weather]
         )
 
+        app = self.create_app(agent)
         adk_service = AdkBasedLLMService(
             session_service=self.session_service,
             session_params=self.session_params,
-            agent=agent
+            app=app
         )
         context_aggregators = adk_service.create_context_aggregator()
         pipeline = Pipeline([
@@ -224,10 +236,11 @@ class TestAdkBasedLLMService(unittest.IsolatedAsyncioTestCase):
             tools=[get_time, get_date]
         )
 
+        app = self.create_app(agent)
         adk_service = AdkBasedLLMService(
             session_service=self.session_service,
             session_params=self.session_params,
-            agent=agent
+            app=app
         )
         context_aggregators = adk_service.create_context_aggregator()
         pipeline = Pipeline([
@@ -280,10 +293,11 @@ class TestAdkBasedLLMService(unittest.IsolatedAsyncioTestCase):
             tools=[search_database]
         )
 
+        app = self.create_app(agent)
         adk_service = AdkBasedLLMService(
             session_service=self.session_service,
             session_params=self.session_params,
-            agent=agent
+            app=app
         )
         context_aggregators = adk_service.create_context_aggregator()
         pipeline = Pipeline([
@@ -323,10 +337,11 @@ class TestAdkBasedLLMService(unittest.IsolatedAsyncioTestCase):
             model=mock_llm
         )
 
+        app = self.create_app(agent)
         adk_service = AdkBasedLLMService(
             session_service=self.session_service,
             session_params=self.session_params,
-            agent=agent
+            app=app
         )
         context_aggregators = adk_service.create_context_aggregator()
         pipeline = Pipeline([
@@ -362,10 +377,11 @@ class TestAdkBasedLLMService(unittest.IsolatedAsyncioTestCase):
             model=mock_llm
         )
 
+        app = self.create_app(agent)
         adk_service = AdkBasedLLMService(
             session_service=self.session_service,
             session_params=self.session_params,
-            agent=agent
+            app=app
         )
 
         aggregators = adk_service.create_context_aggregator()
@@ -390,10 +406,11 @@ class TestAdkBasedLLMService(unittest.IsolatedAsyncioTestCase):
             model=mock_llm
         )
 
+        app = self.create_app(agent)
         adk_service = AdkBasedLLMService(
             session_service=self.session_service,
             session_params=self.session_params,
-            agent=agent
+            app=app
         )
         context_aggregators = adk_service.create_context_aggregator()
         pipeline = Pipeline([
@@ -433,10 +450,11 @@ class TestAdkBasedLLMService(unittest.IsolatedAsyncioTestCase):
             model=mock_llm
         )
 
+        app = self.create_app(agent)
         adk_service = AdkBasedLLMService(
             session_service=self.session_service,
             session_params=self.session_params,
-            agent=agent
+            app=app
         )
 
         # Verify the runner exists

@@ -7,8 +7,9 @@ from pipecat.frames.frames import (
 from pipecat.tests.utils import run_test, SleepFrame
 from google.adk.sessions import InMemorySessionService
 from google.adk.agents import Agent
+from google.adk.apps.app import App
 from google.adk.runners import Runner
-from pipecat_adk import SessionParams
+from pipecat_adk import SessionParams, InterruptionHandlerPlugin
 from pipecat_adk.context_aggregators import AdkAssistantContextAggregator
 from tests.mocks import MockLLM
 from tests.test_utils import simplify_events
@@ -29,16 +30,20 @@ class TestAdkAssistantContextAggregator(unittest.IsolatedAsyncioTestCase):
         # Create session
         await self.session_service.create_session(**self.session_params.model_dump())
 
-        # Create mock agent and runner
+        # Create mock agent, app, and runner
         mock_llm = MockLLM.single("Test response")
         self.agent = Agent(
             name="test_agent",
             description="A test agent",
             model=mock_llm
         )
+        app = App(
+            name=self.session_params.app_name,
+            root_agent=self.agent,
+            plugins=[InterruptionHandlerPlugin()],
+        )
         self.runner = Runner(
-            app_name=self.session_params.app_name,
-            agent=self.agent,
+            app=app,
             session_service=self.session_service
         )
 
