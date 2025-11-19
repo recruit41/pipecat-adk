@@ -23,6 +23,8 @@ from pipecat.services.google.tts import GoogleTTSService
 from pipecat.transcriptions.language import Language
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.network.small_webrtc import SmallWebRTCTransport
+from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIProcessor
+from pipecat.frames.frames import LLMRunFrame
 
 from pipecat_adk import AdkBasedLLMService, SessionParams
 from agent import app
@@ -87,19 +89,23 @@ async def run_bot(webrtc_connection):
         vad_analyzer=SileroVADAnalyzer(),
     )
 
-    pipecat_transport = SmallWebRTCTransport(
+    transport = SmallWebRTCTransport(
         webrtc_connection=webrtc_connection, params=transport_params
     )
+
+    rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
+
 
     # Create pipeline
     pipeline = Pipeline(
         [
-            pipecat_transport.input(),  # Audio input from user
+            transport.input(),  # Audio input from user
+            rtvi,
             stt,  # Speech-to-text
             context_aggregator.user(),  # Package user input for ADK
             llm,  # ADK agent
             tts,  # Text-to-speech
-            pipecat_transport.output(),  # Audio output to user
+            transport.output(),  # Audio output to user
             context_aggregator.assistant(),  # Handle interruptions
         ]
     )
@@ -107,17 +113,35 @@ async def run_bot(webrtc_connection):
     # Create pipeline task
     task = PipelineTask(
         pipeline,
-        params=PipelineParams(allow_interruptions=True),
+        params=PipelineParams(
+            allow_interruptions=True,
+            enable_metrics=True,
+            enable_usage_metrics=True
+        ),
+        observers=[RTVIObserver(rtvi)],
     )
 
+    # Handle client connection
+    @rtvi.event_handler("on_client_ready")
+    async def on_client_ready(rtvi):
+        # Signal bot is ready to receive messages
+        await rtvi.set_bot_ready()
+        # Initialize the conversation
+        await task.queue_frames([LLMRunFrame()])
+
+    # Handle participant disconnection
+    @transport.event_handler("on_participant_left")
+    async def on_participant_left(transport, participant, reason):
+        await task.cancel()
+
     # Add transport event handlers
-    @pipecat_transport.event_handler("on_client_connected")
+    @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         logger.info("Client connected")
         # Send greeting prompt to start the conversation
         await task.queue_frames([context_aggregator.user().get_context_frame()])
 
-    @pipecat_transport.event_handler("on_client_disconnected")
+    @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info("Client disconnected")
         await task.cancel()
