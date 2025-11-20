@@ -42,7 +42,7 @@ uv pip install -e /path/to/pipecat-adk
 
 ### Core Components
 
-The library has 5 main components that work together:
+The library has 5 main components that work together, plus 3 frame types for state synchronization:
 
 1. **SessionParams** (`types.py`): Simple dataclass for identifying ADK sessions (app_name, user_id, session_id)
 
@@ -72,6 +72,30 @@ The library has 5 main components that work together:
    - Invokes ADK agents via `runner.run_async()`
    - Converts ADK events to Pipecat frames
    - Pushes function call frames UPSTREAM and DOWNSTREAM to keep all processors informed
+   - Handles state synchronization frames (`AdkAppendEventFrame`, `AdkInvokeAgentFrame`)
+   - Emits `AdkStateDeltaFrame` when state changes occur
+
+### State Synchronization Frames
+
+The library provides three frame types for bidirectional state synchronization between Pipecat and ADK:
+
+1. **AdkStateDeltaFrame** (`frames.py`):
+   - Emitted when ADK produces state_delta (from tools or events)
+   - Flows downstream to transport for client synchronization
+   - Contains `state_delta` (dict) and `source` (author of the change)
+   - Example use: Transport sends state updates to connected clients
+
+2. **AdkAppendEventFrame** (`frames.py`):
+   - Request to append an event to ADK session without invoking the LLM
+   - Used for persisting state changes from client commands
+   - If event contains state_delta, an `AdkStateDeltaFrame` is emitted
+   - Example use: Client submits form data that should be persisted to session
+
+3. **AdkInvokeAgentFrame** (`frames.py`):
+   - Request to invoke ADK agent outside of normal speech flow
+   - Contains `new_content` (Content) and optional `state_delta` (dict)
+   - If state_delta provided, an `AdkStateDeltaFrame` is emitted before invocation
+   - Example use: Client command that requires LLM response after processing
 
 ### Interruption Handling Flow
 

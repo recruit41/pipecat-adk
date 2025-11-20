@@ -47,7 +47,7 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
             ]
 
             # Run the interaction
-            response = await runner.run(user_actions, timeout=2.0)
+            response = await runner.simulate_user(user_actions, timeout=2.0)
 
             # Verify bot said the expected text
             self.assertTrue(response.said("Hi, I am a bot"))
@@ -79,7 +79,7 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
             ]
 
             # Give enough time for bot to start speaking and be interrupted
-            response = await runner.run(user_actions, timeout=3.0)
+            response = await runner.simulate_user(user_actions, timeout=3.0)
 
             # Verify bot started speaking before being interrupted
             self.assertTrue(response.said("Hello"), f"Bot should have started speaking, got: {response.text!r}")
@@ -132,7 +132,7 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
                 WaitForResponse(),
             ]
 
-            response = await runner.run(user_actions, timeout=3.0)
+            response = await runner.simulate_user(user_actions, timeout=3.0)
 
             # Verify bot responded with weather info
             self.assertTrue(response.said("sunny and 72 degrees"))
@@ -195,7 +195,7 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
                 WaitForResponse(),
             ]
 
-            response = await runner.run(user_actions, timeout=3.0)
+            response = await runner.simulate_user(user_actions, timeout=3.0)
 
             # Verify bot confirmed both actions
             self.assertTrue(response.said("72 degrees"))
@@ -236,7 +236,7 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
 
         async with TestRunner(app=app) as runner:
             # First turn
-            response1 = await runner.run([
+            response1 = await runner.simulate_user([
                 Say("Hello"),
                 WaitForResponse(),
             ], timeout=2.0)
@@ -244,7 +244,7 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(response1.said("How can I help"))
 
             # Second turn
-            response2 = await runner.run([
+            response2 = await runner.simulate_user([
                 Say("I need help with a project"),
                 WaitForResponse(),
             ], timeout=2.0)
@@ -252,7 +252,7 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(response2.said("Tell me more"))
 
             # Third turn
-            response3 = await runner.run([
+            response3 = await runner.simulate_user([
                 Say("Can you assist me?"),
                 WaitForResponse(),
             ], timeout=2.0)

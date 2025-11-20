@@ -14,7 +14,7 @@
 import asyncio
 import re
 from dataclasses import dataclass
-from typing import AsyncGenerator, List, Optional, Sequence, Union
+from typing import AsyncGenerator, List, Optional, Sequence, Type, TypeVar, Union
 from typing_extensions import override
 
 from google.adk.events import Event
@@ -56,12 +56,15 @@ from pipecat.pipeline.runner import PipelineRunner
 
 from google.adk.sessions import InMemorySessionService
 from google.adk.apps import App
-from pipecat_adk import AdkBasedLLMService, SessionParams
+from pipecat_adk import AdkBasedLLMService, AdkStateDeltaFrame, SessionParams
 
 # Constants for mock services
 SILENCE = b'\x00'
 SAMPLE_RATE = 16000  # Standard sample rate for testing
 NUM_CHANNELS = 1
+
+# Type variable for generic frame filtering
+F = TypeVar('F', bound=Frame)
 
 def _chunk_string(s: str) -> list[str]:
     """
@@ -152,6 +155,9 @@ class BotOutputTracker:
         self._all_speech_chunks: List[str] = []
         self._all_messages: List[Frame] = []
 
+        # Generic frame capture - captures ALL frames flowing through output
+        self._all_frames: List[Frame] = []
+
     async def append_speech(self, text: str):
         """Called by MockOutputTransport when speech is written."""
         async with self._lock:
@@ -199,6 +205,19 @@ class BotOutputTracker:
     def get_all_messages(self) -> List[Frame]:
         """Get all messages for debugging."""
         return self._all_messages[:]
+
+    async def capture_frame(self, frame: Frame):
+        """Capture any frame flowing through output for test assertions."""
+        async with self._lock:
+            self._all_frames.append(frame)
+
+    def get_frames_of_type(self, frame_type: Type[F]) -> List[F]:
+        """Get all captured frames of a specific type."""
+        return [f for f in self._all_frames if isinstance(f, frame_type)]
+
+    def clear_captured_frames(self):
+        """Clear all captured frames. Useful between test runs."""
+        self._all_frames.clear()
 
 
 class MockLLM(BaseLlm):
@@ -444,17 +463,17 @@ class TestRunner:
         self.transport = MockTransport(input_actions=[])
         self.mock_input = self.transport.input()
         self.mock_output = self.transport.output()
-        adk_service = AdkBasedLLMService(
+        self.adk_service = AdkBasedLLMService(
             session_service=self.session_service,
             session_params=self.session_params,
             app=app
         )
-        context_aggregators = adk_service.create_context_aggregator()
+        context_aggregators = self.adk_service.create_context_aggregator()
         self.pipeline = Pipeline([
             self.mock_input,
             MockSTTService(),
             context_aggregators.user(),
-            adk_service,
+            self.adk_service,
             MockTTSService(),
             self.mock_output,
             context_aggregators.assistant(),  # MUST be after output transport
@@ -473,9 +492,18 @@ class TestRunner:
         """Get all events from the current session."""
         session = await self.session_service.get_session(**self.session_params.model_dump())
         return session.events if session else []
-    
-    
-    async def run(self, user_actions: List[UserAction], timeout: float = 0.5) -> "BotResponse":
+
+    async def queue_frame(self, frame: Frame):
+        """Queue a frame into the pipeline.
+
+        This properly injects frames into the pipeline flow rather than
+        bypassing it by calling process_frame directly on a processor.
+        """
+        if self.task is None:
+            raise RuntimeError("Pipeline not started. Call simulate_user() first.")
+        await self.task.queue_frame(frame)
+
+    async def simulate_user(self, user_actions: List[UserAction], timeout: float = 0.5) -> "BotResponse":
         if self.task is None:
             # First run - start pipeline
             self.task = PipelineTask(self.pipeline, observers=[DebugLogObserver()])
@@ -957,6 +985,9 @@ class MockOutputTransport(BaseOutputTransport):
         2. The MediaSender's async buffering/chunking adds complexity for testing
         3. Direct processing is simpler for test scenarios
         """
+        # Capture ALL frames generically for test assertions
+        await self._bot_output_tracker.capture_frame(frame)
+
         if isinstance(frame, TTSAudioRawFrame):
             # Directly handle audio frame - decode UTF-8 and track speech
             if hasattr(frame, 'audio') and frame.audio:
@@ -1164,6 +1195,19 @@ class BotResponse:
         needle = text if case_sensitive else text.lower()
         haystack = self.text if case_sensitive else self.text.lower()
         return needle in haystack
+
+    # === GENERIC FRAME ACCESS ===
+
+    def get_frames_of_type(self, frame_type: Type[F]) -> List[F]:
+        """Get all captured frames of a specific type.
+
+        Args:
+            frame_type: The type of frame to filter for
+
+        Returns:
+            List of frames matching the specified type
+        """
+        return self._tracker.get_frames_of_type(frame_type)
 
     # === DEBUGGING ===
 

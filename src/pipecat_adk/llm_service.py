@@ -14,6 +14,7 @@ from google.adk.sessions.base_session_service import BaseSessionService
 from google.genai.types import Content, FunctionCall, FunctionResponse
 from loguru import logger
 from pipecat.frames.frames import (
+    Frame,
     FunctionCallFromLLM,
     FunctionCallInProgressFrame,
     FunctionCallResultFrame,
@@ -35,6 +36,7 @@ from .context_aggregators import (
     AdkAssistantContextAggregator,
     AdkUserContextAggregator,
 )
+from .frames import AdkAppendEventFrame, AdkInvokeAgentFrame, AdkStateDeltaFrame
 from .types import SessionParams
 
 
@@ -92,6 +94,46 @@ class AdkBasedLLMService(GoogleLLMService):
             _user=user_aggregator, _assistant=assistant_aggregator
         )
 
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        """Process frames including ADK control frames.
+
+        Handles AdkAppendEventFrame and AdkInvokeAgentFrame for
+        state synchronization between Pipecat and ADK.
+        """
+        # Handle ADK control frames before passing to parent
+        if isinstance(frame, AdkAppendEventFrame):
+            await self._handle_append_event(frame)
+            return
+
+        if isinstance(frame, AdkInvokeAgentFrame):
+            await self._run_adk(frame.new_content, frame.state_delta)
+            return
+
+        await super().process_frame(frame, direction)
+
+    async def _handle_append_event(self, frame: AdkAppendEventFrame) -> None:
+        """Append event to ADK session and emit state delta if present."""
+        session = await self.session_service.get_session(
+            app_name=self.session_params.app_name,
+            user_id=self.session_params.user_id,
+            session_id=self.session_params.session_id
+        )
+        if session is None:
+            raise RuntimeError(
+                f"ADK session not found: app={self.session_params.app_name}, "
+                f"user={self.session_params.user_id}, "
+                f"session={self.session_params.session_id}"
+            )
+
+        await self.session_service.append_event(session, frame.event)
+
+        # If event has state_delta, emit downstream for transport
+        if frame.event.actions and frame.event.actions.state_delta:
+            await self.push_frame(AdkStateDeltaFrame(
+                state_delta=frame.event.actions.state_delta,
+                source=frame.event.author
+            ))
+
     @traced_llm
     async def _process_context(self, context: GoogleLLMContext) -> None:
         messages = context.get_messages()
@@ -106,6 +148,13 @@ class AdkBasedLLMService(GoogleLLMService):
         self, new_message: Content, state_delta: Optional[dict[str, Any]] = None
     ) -> None:
         await self.push_frame(LLMFullResponseStartFrame())
+
+        # If state_delta provided, emit it downstream for transport
+        if state_delta:
+            await self.push_frame(AdkStateDeltaFrame(
+                state_delta=state_delta,
+                source="user"
+            ))
 
         # Initialize token usage counters
         prompt_tokens = 0
@@ -162,7 +211,15 @@ class AdkBasedLLMService(GoogleLLMService):
         Specifically:
             - LLMTextFrame for textual content. Only partial text events. Final text is ignored because it is a repetition.
             - Function call frames to inform Pipecat of function call lifecycle.
+            - AdkStateDeltaFrame for state deltas from tools.
         """
+        # Emit state delta frame when present (e.g., from tool results)
+        if event.actions and event.actions.state_delta:
+            await self.push_frame(AdkStateDeltaFrame(
+                state_delta=event.actions.state_delta,
+                source=event.author
+            ))
+
         if not event.content or not event.content.parts:
             return
 

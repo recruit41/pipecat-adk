@@ -34,8 +34,9 @@ uv pip install -e /path/to/pipecat-adk
 ## Quick Start
 
 ```python
-from pipecat_adk import AdkBasedLLMService, SessionParams
+from pipecat_adk import AdkBasedLLMService, SessionParams, InterruptionHandlerPlugin
 from google.adk.agents import Agent
+from google.adk.apps import App
 from google.adk.sessions import InMemorySessionService
 from pipecat.pipeline.pipeline import Pipeline
 
@@ -46,19 +47,32 @@ agent = Agent(
     instruction="You are a helpful assistant"
 )
 
+# Create ADK App with InterruptionHandlerPlugin
+# IMPORTANT: InterruptionHandlerPlugin is required for proper interruption handling
+app = App(
+    name="my_app",
+    root_agent=agent,
+    plugins=[InterruptionHandlerPlugin()],
+)
+
 # Create session service (any ADK session service works)
 session_service = InMemorySessionService()
 
-# Create LLM service
+# Create session parameters
+session_params = SessionParams(
+    app_name=app.name,
+    user_id="user",
+    session_id="session-123"
+)
+
+# Create the session
+await session_service.create_session(**session_params.model_dump())
+
+# Create LLM service with the App
 llm = AdkBasedLLMService(
     session_service=session_service,
-    session_params=SessionParams(
-        app_name="my-app",
-        user_id="user",
-        session_id="session-123"
-    ),
-    agent=agent,
-    api_key="your-gemini-api-key"
+    session_params=session_params,
+    app=app,
 )
 
 # Create pipeline with context aggregators
@@ -198,11 +212,16 @@ uv run python -m coverage html  # Generate HTML report
 
 ## Examples
 
-See [examples/basic_chatbot.py](examples/basic_chatbot.py) for a complete working example showing:
+See [examples/assistant/](examples/assistant/) for a complete working example showing:
 - Setting up ADK agents with Pipecat pipelines
-- Automatic interruption handling
-- Daily.co transport integration
+- Automatic interruption handling via InterruptionHandlerPlugin
+- WebRTC transport with small-webrtc-prebuilt
 - Voice input/output with Google STT/TTS
+
+The example includes:
+- `agent.py`: Defines the ADK Agent, App, and plugins
+- `bot.py`: Pipeline setup and bot logic
+- `run.py`: FastAPI server for WebRTC signaling
 
 For advanced usage patterns, see the Extension Points section above for examples of:
 - Adding custom context to user messages
