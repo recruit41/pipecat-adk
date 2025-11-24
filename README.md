@@ -27,6 +27,7 @@ If you have an existing Pipecat application, here's what you need to change:
 
 ```python
 from pipecat.services.google import GoogleLLMService
+from pipecat.services.google.llm import GoogleLLMContext
 from pipecat.pipeline.pipeline import Pipeline
 
 # Standard LLM service
@@ -37,7 +38,7 @@ llm = GoogleLLMService(
 
 # Standard context aggregator
 context_aggregator = llm.create_context_aggregator(
-    OpenAILLMContext(messages=[{"role": "system", "content": "You are helpful"}])
+    GoogleLLMContext(messages=[{"role": "system", "content": "You are helpful"}])
 )
 
 pipeline = Pipeline([
@@ -163,17 +164,27 @@ Every event is persisted automatically. You get:
 Example: A quiz application where the client submits answers:
 
 ```python
+from google.adk.events import Event, EventActions
+from google.genai import types as genai_types
+from pipecat_adk import AdkAppendEventFrame, AdkInvokeAgentFrame
+
 # Client submits answer (persist without LLM response)
 event = Event(
     author="user",
-    content=Content(parts=[Part(text="<answer>Paris</answer>")]),
+    content=genai_types.Content(
+        role="user",
+        parts=[genai_types.Part(text="<answer>Paris</answer>")]
+    ),
     actions=EventActions(state_delta={"score": 10})
 )
-await pipeline.push_frame(AdkAppendEventFrame(event=event))
+await task.queue_frame(AdkAppendEventFrame(event=event))
 
 # Or if you want the AI to respond to the submission
-content = Content(parts=[Part(text="Check my answer: Paris")])
-await pipeline.push_frame(AdkInvokeAgentFrame(
+content = genai_types.Content(
+    role="user",
+    parts=[genai_types.Part(text="Check my answer: Paris")]
+)
+await task.queue_frame(AdkInvokeAgentFrame(
     new_content=content,
     state_delta={"last_answer": "Paris"}
 ))
@@ -200,11 +211,14 @@ These frames flow upstream (to processors before the LLM) and downstream (to pro
 
 **The Problem**: You need to inject dynamic context into conversations—current time, user preferences, system warnings, etc.
 
-**Our Solution**: Override `get_custom_context_parts()` in `AdkUserContextAggregator`:
+**Our Solution**: Override `_aggregation_to_content()` in `AdkUserContextAggregator`:
 
 ```python
+from pipecat_adk.context_aggregators import AdkUserContextAggregator
+from google.genai.types import Content, Part
+
 class MyUserAggregator(AdkUserContextAggregator):
-    async def get_custom_context_parts(self):
+    async def _aggregation_to_content(self, aggregation: str) -> Content:
         parts = []
 
         # Add current time
@@ -214,10 +228,13 @@ class MyUserAggregator(AdkUserContextAggregator):
         prefs = await self.get_user_preferences()
         parts.append(Part(text=f"<system>User prefers {prefs.language}</system>"))
 
-        return parts
+        # Add the actual user message
+        parts.append(Part(text=aggregation))
+
+        return Content(role="user", parts=parts)
 ```
 
-These parts are prepended to every user message.
+These parts are included with every user message.
 
 **Tradeoff**: This runs on every user message. Keep it lightweight—avoid slow database queries or API calls here.
 
@@ -245,12 +262,15 @@ Open http://localhost:7860 to interact with the voice assistant.
 
 pipecat-adk provides a comprehensive mock testing infrastructure so you can test your agents without calling real APIs.
 
+**Note**: The testing utilities are located in `tests/mocks.py` and `tests/test_utils.py`. To use them in your own tests, you'll need to copy these files or add the tests directory to your path.
+
 ### MockLLM
 
 Create mock LLM responses for testing:
 
 ```python
-from tests.mocks import MockLLM, TestRunner, Say, WaitForResponse
+# Copy tests/mocks.py to your project, then:
+from mocks import MockLLM, TestRunner, Say, WaitForResponse
 
 # Simple text response
 mock_llm = MockLLM.single("Hello! How can I help?")
@@ -275,7 +295,7 @@ Run end-to-end tests with simulated user actions:
 
 ```python
 import unittest
-from tests.mocks import MockLLM, TestRunner, Say, WaitForResponse
+from mocks import MockLLM, TestRunner, Say, WaitForResponse
 from pipecat_adk import InterruptionHandlerPlugin
 from google.adk.agents import Agent
 from google.adk.apps import App
@@ -374,7 +394,7 @@ async def test_session_state(self):
 ### Test Utilities
 
 ```python
-from tests.test_utils import simplify_events
+from test_utils import simplify_events
 
 # Convert ADK events to simple tuples for assertions
 events = await runner.events()
