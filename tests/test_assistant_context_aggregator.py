@@ -7,7 +7,7 @@ from pipecat.frames.frames import (
 from pipecat.tests.utils import run_test, SleepFrame
 from google.adk.sessions import InMemorySessionService
 from google.adk.agents import Agent
-from google.adk.apps.app import App
+from google.adk.apps.app import App, ResumabilityConfig
 from google.adk.runners import Runner
 from pipecat_adk import SessionParams, InterruptionHandlerPlugin
 from pipecat_adk.context_aggregators import AdkAssistantContextAggregator
@@ -41,6 +41,7 @@ class TestAdkAssistantContextAggregator(unittest.IsolatedAsyncioTestCase):
             name=self.session_params.app_name,
             root_agent=self.agent,
             plugins=[InterruptionHandlerPlugin()],
+            resumability_config=ResumabilityConfig(is_resumable=True),
         )
         self.runner = Runner(
             app=app,

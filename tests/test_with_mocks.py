@@ -9,6 +9,7 @@ import unittest
 
 from google.adk.agents import Agent
 from google.adk.apps import App
+from google.adk.apps.app import ResumabilityConfig
 from google.genai.types import Part
 from pipecat_adk import InterruptionHandlerPlugin
 
@@ -36,6 +37,7 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
             name="agents",
             root_agent=agent,
             plugins=[InterruptionHandlerPlugin()],
+            resumability_config=ResumabilityConfig(is_resumable=True),
         )
 
         # Create test runner with the app
@@ -69,6 +71,7 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
             name="agents",
             root_agent=agent,
             plugins=[InterruptionHandlerPlugin()],
+            resumability_config=ResumabilityConfig(is_resumable=True),
         )
 
         async with TestRunner(app=app, tts_delay=0.05) as runner:
@@ -128,6 +131,7 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
             name="agents",
             root_agent=agent,
             plugins=[InterruptionHandlerPlugin()],
+            resumability_config=ResumabilityConfig(is_resumable=True),
         )
 
         async with TestRunner(app=app) as runner:
@@ -191,6 +195,7 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
             name="agents",
             root_agent=agent,
             plugins=[InterruptionHandlerPlugin()],
+            resumability_config=ResumabilityConfig(is_resumable=True),
         )
 
         async with TestRunner(app=app) as runner:
@@ -237,6 +242,7 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
             name="agents",
             root_agent=agent,
             plugins=[InterruptionHandlerPlugin()],
+            resumability_config=ResumabilityConfig(is_resumable=True),
         )
 
         async with TestRunner(app=app) as runner:

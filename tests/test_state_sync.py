@@ -10,6 +10,7 @@ import unittest
 
 from google.adk.agents import Agent
 from google.adk.apps import App
+from google.adk.apps.app import ResumabilityConfig
 from google.adk.events import Event
 from google.adk.events.event_actions import EventActions
 from google.adk.tools import ToolContext
@@ -61,6 +62,7 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
             name="agents",
             root_agent=agent,
             plugins=[InterruptionHandlerPlugin()],
+            resumability_config=ResumabilityConfig(is_resumable=True),
         )
 
         async with TestRunner(app=app) as runner:
@@ -90,6 +92,7 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
             name="agents",
             root_agent=agent,
             plugins=[InterruptionHandlerPlugin()],
+            resumability_config=ResumabilityConfig(is_resumable=True),
         )
 
         async with TestRunner(app=app) as runner:
@@ -133,6 +136,7 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
             name="agents",
             root_agent=agent,
             plugins=[InterruptionHandlerPlugin()],
+            resumability_config=ResumabilityConfig(is_resumable=True),
         )
 
         async with TestRunner(app=app) as runner:
@@ -176,6 +180,7 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
             name="agents",
             root_agent=agent,
             plugins=[InterruptionHandlerPlugin()],
+            resumability_config=ResumabilityConfig(is_resumable=True),
         )
 
         async with TestRunner(app=app) as runner:
@@ -240,6 +245,7 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
             name="agents",
             root_agent=agent,
             plugins=[InterruptionHandlerPlugin()],
+            resumability_config=ResumabilityConfig(is_resumable=True),
         )
 
         async with TestRunner(app=app) as runner:
@@ -274,6 +280,7 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
             name="agents",
             root_agent=agent,
             plugins=[InterruptionHandlerPlugin()],
+            resumability_config=ResumabilityConfig(is_resumable=True),
         )
 
         async with TestRunner(app=app) as runner:
