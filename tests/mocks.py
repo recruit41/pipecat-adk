@@ -12,9 +12,10 @@
 #
 
 import asyncio
+import copy
 import re
 from dataclasses import dataclass
-from typing import AsyncGenerator, List, Optional, Sequence, Type, TypeVar, Union
+from typing import Any, AsyncGenerator, Callable, Dict, List, Literal, Optional, Type, TypeVar, Union
 from typing_extensions import override
 
 from google.adk.events import Event
@@ -25,6 +26,7 @@ from google.genai.types import Content, Part
 from pipecat.observers.loggers.debug_log_observer import DebugLogObserver
 
 from loguru import logger
+from pydantic import BaseModel
 
 from pipecat.frames.frames import (
     Frame,
@@ -51,8 +53,9 @@ from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.task import PipelineTask
+from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.pipeline.runner import PipelineRunner
+from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIProcessor
 
 from google.adk.sessions import InMemorySessionService
 from google.adk.apps import App
@@ -60,11 +63,34 @@ from pipecat_adk import AdkBasedLLMService, AdkStateDeltaFrame, SessionParams
 
 # Constants for mock services
 SILENCE = b'\x00'
-SAMPLE_RATE = 16000  # Standard sample rate for testing
+INPUT_SAMPLE_RATE = 16000  # Preserve historical behavior for STT/user audio
+OUTPUT_SAMPLE_RATE = 48000  # Higher rate keeps mock PCM packets divisible by 6 bytes
 NUM_CHANNELS = 1
+PCM_BYTES_PER_SAMPLE = 2
+FAKE_AUDIO_CHUNK_MS = 20
+FAKE_AUDIO_PACKET_BYTES = (
+    int(OUTPUT_SAMPLE_RATE * (FAKE_AUDIO_CHUNK_MS / 1000)) * NUM_CHANNELS * PCM_BYTES_PER_SAMPLE
+)
+FAKE_AUDIO_PADDING_GRANULARITY = 6
+
+if FAKE_AUDIO_PACKET_BYTES % FAKE_AUDIO_PADDING_GRANULARITY != 0:
+    raise ValueError(
+        f"Fake audio packet size {FAKE_AUDIO_PACKET_BYTES} must be divisible by "
+        f"{FAKE_AUDIO_PADDING_GRANULARITY}"
+    )
+
+# Backwards compatibility alias
+SAMPLE_RATE = OUTPUT_SAMPLE_RATE
 
 # Type variable for generic frame filtering
 F = TypeVar('F', bound=Frame)
+
+
+@dataclass
+class Turn:
+    """Represents a single conversational turn (user or bot)."""
+    speaker: Literal["user", "bot"]
+    text: str
 
 def _chunk_string(s: str) -> list[str]:
     """
@@ -83,141 +109,170 @@ def _chunk_string(s: str) -> list[str]:
     chunks = re.findall(r'\S+\s*', s)
     return chunks
 
+
+def _split_text_to_payload_chunks(text: str, *, max_bytes: int) -> list[str]:
+    """Split text into chunks that fit into max_bytes when UTF-8 encoded."""
+    if not text:
+        return []
+
+    chunks: list[str] = []
+    current_chars: list[str] = []
+    current_bytes = 0
+
+    for char in text:
+        encoded = char.encode("utf-8")
+        if current_bytes + len(encoded) > max_bytes and current_chars:
+            chunks.append("".join(current_chars))
+            current_chars = [char]
+            current_bytes = len(encoded)
+        else:
+            current_chars.append(char)
+            current_bytes += len(encoded)
+
+    if current_chars:
+        chunks.append("".join(current_chars))
+
+    return chunks
+
+
+def encode_audio_text(text: str, *, padded: bool = False) -> bytes:
+    """Encode text into audio bytes, optionally padding for fake PCM packets."""
+    payload = text.encode("utf-8")
+    if not padded:
+        return payload
+
+    if len(payload) > FAKE_AUDIO_PACKET_BYTES:
+        raise ValueError(
+            f"Payload length {len(payload)} exceeds fake packet size {FAKE_AUDIO_PACKET_BYTES}"
+        )
+
+    padding = FAKE_AUDIO_PACKET_BYTES - len(payload)
+    if padding:
+        payload += b"\x00" * padding
+    return payload
+
+
+def decode_audio_text(packet: bytes, *, padded: bool = False) -> Optional[str]:
+    """Decode audio bytes (optionally padded) back into text."""
+    if not packet:
+        return None
+
+    data = packet.rstrip(b"\x00") if padded else packet
+    if padded and not data:
+        return None
+
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        logger.debug("decode_audio_text: skipping non UTF-8 packet")
+        return None
+
+
 # ============================================================================
-# UserAction DSL for MockInputTransport
+# BotOutput - Shared state for RTVI messages
 # ============================================================================
 
-@dataclass
-class Say:
-    """User speaks the given text."""
-    text: str
+class BotOutput:
+    """Minimal container for RTVI messages sent to the client.
 
-@dataclass
-class WaitForResponse:
-    """Wait until bot finishes speaking."""
-    pass
-
-
-@dataclass
-class WaitTillBotSays:
-    """Wait until bot says specific text."""
-    text: str
-
-
-@dataclass
-class InterruptAfter:
-    """Wait until bot says specific text, then immediately speak."""
-    wait_for_text: str
-    say_text: str
-
-
-@dataclass
-class Join:
-    """User joins the session (designed but not implemented yet)."""
-    pass
-
-
-@dataclass
-class Leave:
-    """User leaves the session (designed but not implemented yet)."""
-    pass
-
-@dataclass
-class WaitForSomeTime:
-    time: float  # seconds to wait
-
-# Type alias for type hints
-UserAction = Union[
-    Say, WaitForResponse, WaitTillBotSays, InterruptAfter, Join, Leave, WaitForSomeTime
-]
-
-
-# ============================================================================
-# BotOutputTracker - Shared state between Input/Output transports
-# ============================================================================
-
-class BotOutputTracker:
-    """Tracks bot output (speech and messages) for test coordination.
-
-    This class represents what the user sees/hears from the bot. It's shared
-    between MockOutputTransport (which writes to it) and MockInputTransport
-    (which reads from it). This mimics real transport behavior where output
-    goes through a channel (network, audio device, etc.).
+    This class tracks all RTVI messages flowing through the output transport,
+    builds the conversation transcript from those messages, and tracks
+    state-sync deltas for client state assertions.
     """
 
     def __init__(self):
-        self._accumulated_speech = ""
-        self._is_speaking = False
-        self._lock = asyncio.Lock()
-        self._speech_changed = asyncio.Event()
+        self._messages: List[Dict[str, Any]] = []
+        self._client_state: Dict[str, Any] = {}
+        self._cond = asyncio.Condition()
 
-        # For debugging
-        self._all_speech_chunks: List[str] = []
-        self._all_messages: List[Frame] = []
+    async def append_message(self, payload: Dict[str, Any]):
+        """Append an RTVI message payload."""
+        async with self._cond:
+            self._messages.append(copy.deepcopy(payload))
+            self._apply_state_delta(payload)
+            self._cond.notify_all()
 
-        # Generic frame capture - captures ALL frames flowing through output
-        self._all_frames: List[Frame] = []
+    @property
+    def messages(self) -> List[Dict[str, Any]]:
+        """Get all RTVI messages (deep copy)."""
+        return copy.deepcopy(self._messages)
 
-    async def append_speech(self, text: str):
-        """Called by MockOutputTransport when speech is written."""
-        async with self._lock:
-            self._accumulated_speech += text
-            self._all_speech_chunks.append(text)
-            if not self._is_speaking and text:
-                self._is_speaking = True
-            self._speech_changed.set()
-            logger.debug(f"BotOutputTracker: Appended speech [{text}], total: [{self._accumulated_speech}]")
+    @property
+    def client_state(self) -> Dict[str, Any]:
+        """Get merged client state from state-sync deltas."""
+        return copy.deepcopy(self._client_state)
 
-    async def mark_speaking_started(self):
-        """Called when bot starts speaking."""
-        async with self._lock:
-            self._is_speaking = True
-            self._speech_changed.set()
+    def _apply_state_delta(self, message: Dict[str, Any]) -> None:
+        """Shallow merge state-sync deltas into client_state."""
+        inner = message.get("data") if message.get("type") == "server-message" else message
+        if not inner:
+            return
+        if inner.get("type") != "state-sync":
+            return
 
-    async def mark_speaking_stopped(self):
-        """Called when bot stops speaking."""
-        async with self._lock:
-            self._is_speaking = False
-            self._speech_changed.set()
+        delta = inner.get("state_delta") or {}
+        for key, value in delta.items():
+            self._client_state[key] = value
 
-    async def add_message(self, frame: Frame):
-        """Called by MockOutputTransport when a message is sent."""
-        async with self._lock:
-            self._all_messages.append(frame)
-            self._speech_changed.set()
+    @property
+    def transcript(self) -> List[Turn]:
+        """Chronological utterance list built from RTVI messages."""
+        convo: List[Turn] = []
+        bot_buffer: List[str] = []
+        in_bot_turn = False
 
-    def last_bot_speech(self) -> str:
-        """Get all accumulated bot speech so far."""
-        return self._accumulated_speech
+        for msg in self._messages:
+            msg_type = msg.get("type")
+            data = msg.get("data") or {}
 
-    def is_bot_speaking(self) -> bool:
-        """Check if bot is currently speaking."""
-        return self._is_speaking
+            if msg_type == "bot-started-speaking":
+                in_bot_turn = True
+                bot_buffer = []
+            elif msg_type == "bot-tts-text":
+                text = data.get("text", "")
+                if in_bot_turn:
+                    bot_buffer.append(text)
+                else:
+                    convo.append(Turn(speaker="bot", text=text))
+            elif msg_type == "interruption" and in_bot_turn:
+                # Flush whatever the bot has said so far to capture partial speech
+                convo.append(Turn(speaker="bot", text="".join(bot_buffer)))
+                bot_buffer = []
+                in_bot_turn = False
+            elif msg_type == "bot-stopped-speaking" and in_bot_turn:
+                convo.append(Turn(speaker="bot", text="".join(bot_buffer)))
+                bot_buffer = []
+                in_bot_turn = False
+            elif msg_type == "user-transcription" and data.get("final"):
+                convo.append(Turn(speaker="user", text=data.get("text", "")))
 
-    async def wait_for_speech_change(self, timeout: float = 0.2):
-        """Wait for speech state to change (for synchronization)."""
-        try:
-            await asyncio.wait_for(self._speech_changed.wait(), timeout=timeout)
-            self._speech_changed.clear()
-        except asyncio.TimeoutError:
-            pass
+        if bot_buffer:
+            convo.append(Turn(speaker="bot", text="".join(bot_buffer)))
 
-    def get_all_messages(self) -> List[Frame]:
-        """Get all messages for debugging."""
-        return self._all_messages[:]
+        return convo
 
-    async def capture_frame(self, frame: Frame):
-        """Capture any frame flowing through output for test assertions."""
-        async with self._lock:
-            self._all_frames.append(frame)
+    async def wait_for_message_type(
+        self,
+        message_type: str,
+        *,
+        start_index: int = 0,
+        timeout: float = 1.0,
+    ) -> int:
+        """Wait for the next message of a given type and return its index."""
+        found_idx: Optional[int] = None
 
-    def get_frames_of_type(self, frame_type: Type[F]) -> List[F]:
-        """Get all captured frames of a specific type."""
-        return [f for f in self._all_frames if isinstance(f, frame_type)]
+        def _has_message() -> bool:
+            nonlocal found_idx
+            for idx in range(start_index, len(self._messages)):
+                if self._messages[idx].get("type") == message_type:
+                    found_idx = idx
+                    return True
+            return False
 
-    def clear_captured_frames(self):
-        """Clear all captured frames. Useful between test runs."""
-        self._all_frames.clear()
+        async with self._cond:
+            await asyncio.wait_for(self._cond.wait_for(_has_message), timeout=timeout)
+            assert found_idx is not None
+            return found_idx
 
 
 class MockLLM(BaseLlm):
@@ -445,13 +500,36 @@ class MockLLM(BaseLlm):
 
 
 class TestRunner:
-    """Test harness for running pipecat pipelines with appropriate services
+    """Test harness for running pipecat pipelines with conversational API.
+
+    This class sets up a complete pipeline with mock services and provides
+    a conversational API for driving tests:
+
+        async with TestRunner(app=app) as runner:
+            await runner.join_and_wait_for_response()
+            assert "Hello" in runner.last_bot_message
+
+            await runner.speak_and_wait_for_response("Hi there")
+            assert runner.transcript == [
+                Turn("bot", "Hello!"),
+                Turn("user", "Hi there"),
+                Turn("bot", "Nice to meet you!"),
+            ]
     """
 
     def __init__(
         self,
-        app: App
+        app: App,
+        *,
+        tts_delay: float = 0.0,
     ):
+        """Initialize the test runner.
+
+        Args:
+            app: The ADK App containing the agent and plugins.
+            tts_delay: Per-chunk TTS delay in seconds. Use ~0.05 for
+                       interruption tests; leave 0 for fastest runs.
+        """
         self.session_params = SessionParams(
             app_name="agents",
             session_id="test_session",
@@ -459,70 +537,215 @@ class TestRunner:
         )
         self.session_service = InMemorySessionService()
 
-        # MockTransport creates and connects input/output transports with shared tracker
-        self.transport = MockTransport(input_actions=[])
+        # Create transport with shared BotOutput tracker
+        self.transport = MockTransport()
         self.mock_input = self.transport.input()
         self.mock_output = self.transport.output()
+        self._bot_output = self.transport.bot_output()
+
+        # Create ADK service
         self.adk_service = AdkBasedLLMService(
             session_service=self.session_service,
             session_params=self.session_params,
-            app=app
+            app=app,
         )
         context_aggregators = self.adk_service.create_context_aggregator()
+
+        # Create RTVI processor for message serialization
+        self._rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
+
+        # Build pipeline with RTVI
         self.pipeline = Pipeline([
             self.mock_input,
+            self._rtvi,  # RTVI observes pipeline events
             MockSTTService(),
             context_aggregators.user(),
             self.adk_service,
-            MockTTSService(),
+            MockTTSService(tts_delay=tts_delay),
             self.mock_output,
             context_aggregators.assistant(),  # MUST be after output transport
         ])
-        self.task = None
-        self.runner = None
-        self._pipeline_task = None
 
+        self.task: Optional[PipelineTask] = None
+        self.runner: Optional[PipelineRunner] = None
+        self._pipeline_task: Optional[asyncio.Task] = None
+        self._joined = False
+
+    # === Black-box assertion properties ===
+
+    @property
+    def messages(self) -> List[Dict[str, Any]]:
+        """All RTVI messages sent to the client."""
+        return self._bot_output.messages
+
+    @property
+    def transcript(self) -> List[Turn]:
+        """Conversation transcript built from RTVI messages."""
+        return self._bot_output.transcript
+
+    @property
+    def bot_messages(self) -> List[str]:
+        """List of all bot utterances."""
+        return [turn.text for turn in self.transcript if turn.speaker == "bot"]
+
+    @property
+    def last_bot_message(self) -> str:
+        """Most recent bot utterance."""
+        if not self.bot_messages:
+            raise ValueError("No bot messages yet. Did you forget to call wait_for_response()?")
+        return self.bot_messages[-1]
+
+    @property
+    def client_state(self) -> Dict[str, Any]:
+        """Merged client state from state-sync deltas."""
+        return self._bot_output.client_state
+
+    # === Gray-box inspection methods ===
 
     async def session_state(self) -> dict:
-        """Get current session state from session service."""
+        """Get current ADK session state (gray-box)."""
         session = await self.session_service.get_session(**self.session_params.model_dump())
         return session.state if session else {}
 
     async def events(self) -> List[Event]:
-        """Get all events from the current session."""
+        """Get all ADK session events (gray-box)."""
         session = await self.session_service.get_session(**self.session_params.model_dump())
         return session.events if session else []
 
-    async def queue_frame(self, frame: Frame):
-        """Queue a frame into the pipeline.
+    # === Conversational API ===
 
-        This properly injects frames into the pipeline flow rather than
-        bypassing it by calling process_frame directly on a processor.
+    async def _ensure_started(self):
+        """Start the pipeline if it hasn't been started yet."""
+        if self.task is not None:
+            return
+        self.task = PipelineTask(
+            self.pipeline,
+            params=PipelineParams(allow_interruptions=True),
+            observers=[RTVIObserver(self._rtvi), DebugLogObserver()],
+        )
+        self.runner = PipelineRunner()
+        self._pipeline_task = asyncio.create_task(self.runner.run(self.task))
+        await asyncio.sleep(0.05)
+
+    def _ensure_joined(self):
+        """Raise if join() hasn't been called."""
+        if not self._joined:
+            raise RuntimeError("TestRunner.join() must be called before driving the pipeline")
+
+    async def join(self):
+        """Simulate the client joining/connecting."""
+        await self._ensure_started()
+        if self._joined:
+            return
+        participant = {"id": "test-user", "name": "Test User"}
+        await self.transport._call_event_handler("on_participant_joined", participant)
+        await self.transport._call_event_handler("on_client_connected", participant)
+        self._joined = True
+
+    async def join_and_wait_for_response(self, timeout: float = 60.0):
+        """Join and wait for bot's first response."""
+        await self.join()
+        await self.wait_for_response(timeout=timeout)
+
+    async def speak(self, speech: str):
+        """Inject user speech into the pipeline."""
+        self._ensure_joined()
+        await self.mock_input.push_speech(speech)
+
+    async def speak_and_wait_for_response(self, speech: str, timeout: float = 60.0):
+        """Speak and wait for bot's response."""
+        await self.speak(speech)
+        await self.wait_for_response(timeout=timeout)
+
+    async def push_message(self, message_type: str, data: Union[BaseModel, dict, None] = None):
+        """Inject a client message into the pipeline."""
+        self._ensure_joined()
+        await self.mock_input.push_message(message_type, data)
+
+    async def queue_frame(self, frame: Frame):
+        """Queue a frame into the pipeline task.
+
+        Use this to inject frames like AdkAppendEventFrame or AdkInvokeAgentFrame
+        directly into the pipeline for processing.
+
+        Raises:
+            RuntimeError: If join() hasn't been called or task doesn't exist.
         """
+        self._ensure_joined()
         if self.task is None:
-            raise RuntimeError("Pipeline not started. Call simulate_user() first.")
+            raise RuntimeError("Pipeline task not initialized")
         await self.task.queue_frame(frame)
 
-    async def simulate_user(self, user_actions: List[UserAction], timeout: float = 0.5) -> "BotResponse":
-        if self.task is None:
-            # First run - start pipeline
-            self.task = PipelineTask(self.pipeline, observers=[DebugLogObserver()])
-            self.runner = PipelineRunner()
-            self._pipeline_task = asyncio.create_task(
-                self.runner.run(self.task)
-            )
-            # Give pipeline time to start
-            await asyncio.sleep(0.1)
+    async def stay_silent(self, iterations: int = 10, delay: float = 0.01):
+        """Push silence frames without waiting for response.
 
-        # Add new actions to transport
-        self.mock_input.add_actions(user_actions)
+        Use after push_message() when the message doesn't trigger an LLM response
+        but you need to ensure it's fully processed.
+        """
+        self._ensure_joined()
+        for _ in range(iterations):
+            await self.mock_input.push_silence()
+            await asyncio.sleep(delay)
 
-        # Wait for bot to respond (simple timeout-based approach)
-        # In production, could use more sophisticated synchronization
-        await asyncio.sleep(timeout)
+    async def wait_for(
+        self,
+        predicate: Callable[[BotOutput, List[Dict[str, Any]]], bool],
+        timeout: float = 60.0,
+    ):
+        """Wait until predicate(bot_output, delta_messages) returns True."""
+        self._ensure_joined()
+        start_index = len(self.messages)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
 
-        # Return BotResponse with snapshot of what was actually sent to client
-        return BotResponse(self.transport._bot_output_tracker)
+        while True:
+            delta_messages = self._bot_output.messages[start_index:]
+            if predicate(self._bot_output, delta_messages):
+                return
+
+            if loop.time() >= deadline:
+                raise TimeoutError(f"wait_for timed out after {timeout}s")
+
+            await self.mock_input.push_silence()
+            await asyncio.sleep(0.01)
+
+    async def wait_for_bot_to_start_speaking(self, timeout: float = 60.0):
+        """Wait until bot-started-speaking arrives."""
+        def _started(_: BotOutput, delta_messages: List[Dict[str, Any]]) -> bool:
+            return any(msg.get("type") == "bot-started-speaking" for msg in delta_messages)
+        await self.wait_for(_started, timeout=timeout)
+
+    async def wait_for_response(self, timeout: float = 60.0):
+        """Wait for bot-started-speaking followed by bot-stopped-speaking."""
+        def _finished(_: BotOutput, delta_messages: List[Dict[str, Any]]) -> bool:
+            started = False
+            for msg in delta_messages:
+                if msg.get("type") == "bot-started-speaking":
+                    started = True
+                if started and msg.get("type") == "bot-stopped-speaking":
+                    return True
+            return False
+        await self.wait_for(_finished, timeout=timeout)
+
+    async def interrupt_bot(self, message: str, timeout: float = 60.0):
+        """Wait for bot to start speaking, then inject interruption."""
+        def _started_and_spoke(_: BotOutput, delta_messages: List[Dict[str, Any]]) -> bool:
+            started = False
+            spoke = False
+            for msg in delta_messages:
+                if msg.get("type") == "bot-started-speaking":
+                    started = True
+                if started and msg.get("type") == "bot-tts-text":
+                    data = msg.get("data") or {}
+                    if data.get("text"):
+                        spoke = True
+                if started and spoke:
+                    return True
+            return False
+        await self.wait_for(_started_and_spoke, timeout=timeout)
+        await self.speak(message)
+
+    # === Lifecycle ===
 
     async def cleanup(self):
         """Clean up resources."""
@@ -534,11 +757,7 @@ class TestRunner:
                 pass
 
     async def __aenter__(self):
-        """
-        Support async context manager (async with statement).
-
-        Creates all necessary database records before the test starts.
-        """
+        """Support async context manager."""
         # Create session before pipeline starts
         session = await self.session_service.create_session(
             **self.session_params.model_dump()
@@ -558,39 +777,26 @@ class MockTransport(BaseTransport):
     This transport connects MockInputTransport and MockOutputTransport,
     and provides event handler registration for testing transport callbacks.
 
-    The transport creates a shared BotOutputTracker that represents the
+    The transport creates a shared BotOutput that represents the
     communication channel between bot (output) and user (input). Everything
-    written by MockOutputTransport is tracked here, and MockInputTransport
-    reads from it to simulate what the user sees/hears.
+    written by MockOutputTransport is tracked here.
     """
 
-    def __init__(
-        self,
-        input_actions: Sequence[UserAction] = [],
-        *args,
-        **kwargs
-    ):
-        """Initialize MockTransport with input/output transports.
-
-        Args:
-            input_actions: Initial sequence of UserAction instances for the input transport.
-            *args, **kwargs: Additional arguments passed to BaseTransport.
-        """
+    def __init__(self, *args, **kwargs):
+        """Initialize MockTransport with input/output transports."""
         super().__init__(*args, **kwargs)
 
-        # Create shared tracker for bot output (speech and messages)
-        # This represents what actually reaches the user
-        self._bot_output_tracker = BotOutputTracker()
+        # Create shared tracker for bot output (RTVI messages)
+        self._bot_output = BotOutput()
 
         # Create input and output transports with required dependencies
         self._input_transport = MockInputTransport(
-            actions=input_actions,
             parent_transport=self,
-            bot_output_tracker=self._bot_output_tracker
+            bot_output=self._bot_output
         )
         self._output_transport = MockOutputTransport(
             parent_transport=self,
-            bot_output_tracker=self._bot_output_tracker
+            bot_output=self._bot_output
         )
 
         # Register transport events (similar to DailyTransport)
@@ -607,8 +813,15 @@ class MockTransport(BaseTransport):
         """Return the output transport."""
         return self._output_transport
 
-    async def start_recording(self):
-        """No-op for testing - real transports would start recording."""
+    def bot_output(self) -> BotOutput:
+        """Return the shared BotOutput tracker."""
+        return self._bot_output
+
+    async def start_recording(self, streaming_settings=None, stream_id=None, force_new=None):
+        """No-op for testing - real transports would start recording.
+
+        Signature matches DailyTransport.start_recording for compatibility.
+        """
         logger.debug(f"{self}: Mock start_recording called (no-op)")
 
     async def stop_recording(self):
@@ -660,316 +873,139 @@ class MockVADAnalyzer(VADAnalyzer):
 
 
 class MockInputTransport(BaseInputTransport):
-    """Mock input transport that executes a sequence of user actions.
+    """Mock input transport that lets tests inject user speech or client messages.
 
-    This transport simulates user behavior by executing a predefined sequence
-    of actions like speaking text, waiting for bot responses, and interrupting.
-    It's designed for end-to-end testing of pipecat pipelines.
-
-    Examples:
-        # Basic conversation with wait
-        user_actions = [
-            Say("Hello"),
-            WaitForResponse(),
-            Say("My name is John"),
-        ]
-
-        # Conditional action based on bot speech
-        user_actions = [
-            Say("I'm looking for a job"),
-            WaitTillBotSays("position"),  # Wait until bot mentions "position"
-            Say("Software Engineer")
-        ]
-
-        # Test interruption handling
-        user_actions = [
-            Say("Tell me about your company"),
-            InterruptAfter("We are a", "Actually, I have a question"),  # Interrupt mid-sentence
-        ]
+    This transport provides direct methods for injecting user input:
+    - push_speech(text): Inject user speech as UTF-8 audio chunks
+    - push_message(type, data): Inject client messages
+    - push_silence(): Inject silence frame for liveliness
     """
 
     def __init__(
         self,
-        actions: Sequence[UserAction],
         parent_transport: 'MockTransport',
-        bot_output_tracker: BotOutputTracker,
+        bot_output: BotOutput,
         **kwargs
     ):
-        """Initialize the mock input transport with user actions.
+        """Initialize the mock input transport.
 
         Args:
-            actions: Sequence of UserAction instances to execute sequentially.
             parent_transport: The parent MockTransport that owns this input transport.
-            bot_output_tracker: Shared tracker for bot output (speech and messages).
+            bot_output: Shared BotOutput for tracking messages.
             **kwargs: Additional arguments passed to BaseInputTransport.
         """
-        # Create TransportParams with audio enabled
         params = TransportParams(
             audio_in_enabled=True,
-            audio_in_sample_rate=SAMPLE_RATE,
+            audio_in_sample_rate=INPUT_SAMPLE_RATE,
             audio_in_channels=NUM_CHANNELS,
             audio_in_stream_on_start=True,
-            audio_in_passthrough=True,  # Pass audio frames downstream after VAD
-            vad_analyzer=MockVADAnalyzer()
+            audio_in_passthrough=True,
+            vad_analyzer=MockVADAnalyzer(),
         )
         super().__init__(params=params, **kwargs)
-
-        # Action queue for dynamic action addition
-        self._action_queue: asyncio.Queue = asyncio.Queue()
-        self._new_actions_event = asyncio.Event()
-
-        # Populate initial actions
-        for action in actions:
-            self._action_queue.put_nowait(action)
-
-        self._streaming_task = None
         self._parent_transport: MockTransport = parent_transport
-        self._bot_output_tracker: BotOutputTracker = bot_output_tracker
+        self._bot_output: BotOutput = bot_output
 
-    def add_actions(self, actions: List[UserAction]):
-        """Add new actions to be processed dynamically.
-
-        This allows multi-turn testing by adding actions after pipeline starts.
-
-        Args:
-            actions: List of UserAction instances to add to the queue.
-        """
-        for action in actions:
-            self._action_queue.put_nowait(action)
-        self._new_actions_event.set()
-
+    @override
     async def start(self, frame: StartFrame):
-        """Start transport and begin streaming actions."""
+        """Start transport."""
         await super().start(frame)
         await self.set_transport_ready(frame)
-        if self._params.audio_in_stream_on_start:
-            await self.start_audio_in_streaming()
 
-    async def start_audio_in_streaming(self):
-        """Start the audio streaming task."""
-        if not self._params.audio_in_enabled:
-            return
-
-        logger.debug(f"{self}: Starting audio streaming")
-
-        if not self._streaming_task:
-            self._streaming_task = self.create_task(
-                self._audio_streaming_task_handler()
-            )
-
-    async def _audio_streaming_task_handler(self):
-        """Main loop processing actions from queue."""
-        logger.debug(f"{self}: Starting action handler")
-
-        while True:
-            try:
-                # Try to get action immediately
-                action = self._action_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                # Wait for new actions with timeout
-                try:
-                    await asyncio.wait_for(
-                        self._new_actions_event.wait(),
-                        timeout=30.0
-                    )
-                    self._new_actions_event.clear()
-                    continue
-                except asyncio.TimeoutError:
-                    logger.debug(f"{self}: Action queue timeout, continuing to wait")
-                    continue
-
-            # Process action
-            if isinstance(action, Say):
-                await self._handle_say(action)
-            elif isinstance(action, WaitForResponse):
-                await self._handle_wait_for_response()
-            elif isinstance(action, WaitTillBotSays):
-                await self._handle_wait_till_bot_says(action)
-            elif isinstance(action, InterruptAfter):
-                await self._handle_interrupt_after(action)
-            elif isinstance(action, Join):
-                await self._handle_join(action)
-            elif isinstance(action, Leave):
-                await self._handle_leave(action)
-            elif isinstance(action, WaitForSomeTime):
-                await asyncio.sleep(action.time)
-            else:
-                logger.warning(f"{self}: Unknown action type: {action.__class__.__name__}")
-
+    @override
     async def stop(self, frame: EndFrame):
-        """Stop transport and clean up streaming task."""
+        """Stop transport."""
         await super().stop(frame)
-        await self._cancel_streaming_task()
 
+    @override
     async def cancel(self, frame: CancelFrame):
-        """Cancel transport and clean up streaming task."""
+        """Cancel transport."""
         await super().cancel(frame)
-        await self._cancel_streaming_task()
 
-    async def _cancel_streaming_task(self):
-        """Cancel the action streaming task if running."""
-        if self._streaming_task:
-            await self.cancel_task(self._streaming_task)
-            self._streaming_task = None
-
-    async def _handle_say(self, action: Say):
-        """Emit user audio frames for the given text.
-
-        Follows the same word-based chunking logic as MockTTSService but
-        emits UserAudioRawFrame instead of TTSAudioRawFrame.
-        """
-        logger.debug(f"{self}: User says: [{action.text}]")
-
-        # Split text into word-based chunks (same as MockTTSService)
-        chunks = _chunk_string(action.text)
-
-        for chunk in chunks:
-            audio_bytes = chunk.encode("utf-8")
+    async def push_speech(self, speech: str):
+        """Inject user speech as UTF-8 audio chunks."""
+        for chunk in _chunk_string(speech):
+            audio_bytes = encode_audio_text(chunk)
             frame = UserAudioRawFrame(
                 audio=audio_bytes,
-                sample_rate=SAMPLE_RATE,
-                num_channels=NUM_CHANNELS
+                sample_rate=INPUT_SAMPLE_RATE,
+                num_channels=NUM_CHANNELS,
             )
             await self.push_audio_frame(frame)
 
-    async def _emit_silence(self):
-        """Emit a single silence frame for liveliness.
+    async def push_message(
+        self,
+        message_type: str,
+        data: Union[BaseModel, dict, None] = None,
+    ):
+        """Inject a client message into the pipeline."""
+        # Create message payload for RTVI
+        from pipecat.frames.frames import InputTransportMessageFrame
+        from pipecat.processors.frameworks.rtvi import RTVI_MESSAGE_LABEL
+        import uuid
 
-        Silence is a single byte b'\x00' emitted every 200ms to prevent
-        downstream from thinking the connection has issues.
-        """
+        msg_id = str(uuid.uuid4())
+        message_data = None
+        if data is not None:
+            if isinstance(data, BaseModel):
+                message_data = data.model_dump(exclude_none=True)
+            else:
+                message_data = data
+
+        transport_message = {
+            "label": RTVI_MESSAGE_LABEL,
+            "type": "client-message",
+            "id": msg_id,
+            "data": {
+                "t": message_type,
+                "d": message_data,
+            },
+        }
+        frame = InputTransportMessageFrame(message=transport_message)
+        await self.push_frame(frame, FrameDirection.DOWNSTREAM)
+
+    async def push_silence(self):
+        """Inject a single silence frame to keep audio stream alive."""
         frame = UserAudioRawFrame(
-            audio=SILENCE,  # Single byte b'\x00'
-            sample_rate=SAMPLE_RATE,
-            num_channels=NUM_CHANNELS
+            audio=SILENCE,
+            sample_rate=INPUT_SAMPLE_RATE,
+            num_channels=NUM_CHANNELS,
         )
         await self.push_audio_frame(frame)
 
-    async def _handle_wait_for_response(self):
-        """Wait for bot's complete response cycle, emitting silence periodically.
-
-        This implements the semantic: user speaks -> wait for bot to start -> wait for bot to finish.
-        Emits silence frames every 200ms for liveliness while waiting.
-
-        Uses the BotOutputTracker to check if bot has spoken and if it's still speaking.
-        """
-        logger.debug(f"{self}: Waiting for bot to respond")
-
-        # Track the initial speech length to detect when bot starts
-        initial_speech_len = len(self._bot_output_tracker.last_bot_speech())
-
-        # First, wait for bot to START speaking (speech length increases)
-        while len(self._bot_output_tracker.last_bot_speech()) == initial_speech_len:
-            # Emit silence for liveliness
-            await self._emit_silence()
-
-            # Wait for speech change or timeout
-            await self._bot_output_tracker.wait_for_speech_change(timeout=0.2)
-
-        # Then, wait for bot to STOP speaking (no new speech for a while)
-        # We consider bot done when speech doesn't change for 0.5s
-        last_speech = self._bot_output_tracker.last_bot_speech()
-        stable_count = 0
-        while stable_count < 2:  # Need 2 consecutive stable checks (~0.4s)
-            # Emit silence for liveliness
-            await self._emit_silence()
-
-            # Wait a bit
-            await self._bot_output_tracker.wait_for_speech_change(timeout=0.2)
-
-            current_speech = self._bot_output_tracker.last_bot_speech()
-            if current_speech == last_speech:
-                stable_count += 1
-            else:
-                stable_count = 0
-                last_speech = current_speech
-
-        logger.debug(f"{self}: Bot finished responding")
-
-    async def _handle_wait_till_bot_says(self, action: WaitTillBotSays):
-        """Wait until bot says specific text, emitting silence periodically."""
-        logger.debug(f"{self}: Waiting for bot to say: [{action.text}]")
-
-        while True:
-            # Check if bot has said the expected text
-            if action.text in self._bot_output_tracker.last_bot_speech():
-                break
-
-            # Emit silence for liveliness
-            await self._emit_silence()
-
-            # Wait for speech change or timeout
-            await self._bot_output_tracker.wait_for_speech_change(timeout=0.2)
-
-        logger.debug(f"{self}: Bot said the expected text")
-
-    async def _handle_interrupt_after(self, action: InterruptAfter):
-        """Wait for bot to say text, then immediately speak.
-
-        This combines WaitTillBotSays with Say to simulate an interruption.
-        """
-        logger.debug(f"{self}: Will interrupt after bot says: [{action.wait_for_text}]")
-
-        # First wait for bot to say the trigger text
-        while True:
-            # Check if bot has said the trigger text
-            if action.wait_for_text in self._bot_output_tracker.last_bot_speech():
-                break
-
-            await self._emit_silence()
-            await self._bot_output_tracker.wait_for_speech_change(timeout=0.2)
-
-        logger.debug(f"{self}: Interrupting with: [{action.say_text}]")
-
-        # Then immediately say the interruption text
-        await self._handle_say(Say(action.say_text))
-
-    async def _handle_join(self, _action: Join):
-        """Handle Join action by triggering transport callbacks."""
-        logger.debug(f"{self}: User joined")
-        # Simulate participant joining - pass a mock participant object
-        participant = {"id": "test-user", "name": "Test User"}
-        await self._parent_transport._call_event_handler("on_participant_joined", participant)
-        await self._parent_transport._call_event_handler("on_client_connected", participant)
-
-    async def _handle_leave(self, _action: Leave):
-        """Handle Leave action by triggering transport callbacks."""
-        logger.debug(f"{self}: User left")
-        participant = {"id": "test-user", "name": "Test User"}
-        await self._parent_transport._call_event_handler("on_participant_left", participant, "user_left")
-
 
 class MockOutputTransport(BaseOutputTransport):
-    """Mock output transport that uses only contract methods.
+    """Mock output transport that tracks RTVI messages.
 
     This transport uses ONLY the public contract methods (write_audio_frame,
-    send_message) to track what's sent to the user. It does NOT override
-    process_frame to peek at internal frame flow.
+    send_message) to track what's sent to the user.
 
-    Everything written via these methods is tracked in the shared
-    BotOutputTracker, which MockInputTransport can read from.
+    RTVI messages are tracked via send_message() and stored in the shared
+    BotOutput for test assertions.
     """
 
     def __init__(
         self,
         parent_transport: 'MockTransport',
-        bot_output_tracker: BotOutputTracker,
+        bot_output: BotOutput,
         **kwargs
     ):
         """Initialize the mock output transport.
 
         Args:
             parent_transport: The parent MockTransport that owns this output transport.
-            bot_output_tracker: Shared tracker for bot output (speech and messages).
+            bot_output: Shared BotOutput for tracking messages.
             **kwargs: Additional arguments passed to BaseOutputTransport.
         """
         params = TransportParams(
             audio_out_enabled=True,
-            audio_out_sample_rate=SAMPLE_RATE,
+            audio_out_sample_rate=OUTPUT_SAMPLE_RATE,
+            audio_out_channels=NUM_CHANNELS,
+            audio_out_10ms_chunks=FAKE_AUDIO_CHUNK_MS // 10,
         )
         super().__init__(params=params, **kwargs)
         self._parent_transport: MockTransport = parent_transport
-        self._bot_output_tracker: BotOutputTracker = bot_output_tracker
+        self._bot_output: BotOutput = bot_output
 
     async def start(self, frame: StartFrame):
         """Initialize base transport."""
@@ -977,41 +1013,10 @@ class MockOutputTransport(BaseOutputTransport):
         # set_transport_ready() automatically creates the MediaSender
         await self.set_transport_ready(frame)
 
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        """Process frames - handle audio frames directly for mock testing.
-
-        This bypasses the MediaSender for our mock UTF-8 audio because:
-        1. Our UTF-8 text bytes aren't real PCM audio
-        2. The MediaSender's async buffering/chunking adds complexity for testing
-        3. Direct processing is simpler for test scenarios
-        """
-        # Capture ALL frames generically for test assertions
-        await self._bot_output_tracker.capture_frame(frame)
-
-        if isinstance(frame, TTSAudioRawFrame):
-            # Directly handle audio frame - decode UTF-8 and track speech
-            if hasattr(frame, 'audio') and frame.audio:
-                try:
-                    # Decode UTF-8 audio back to text
-                    text = frame.audio.decode('utf-8')
-
-                    # Filter out silence/empty frames
-                    if text and text != '\x00' and not all(c == '\x00' for c in text):
-                        logger.debug(f"{self}: Writing bot speech: [{text}]")
-                        await self._bot_output_tracker.append_speech(text)
-                except UnicodeDecodeError:
-                    # Skip frames that aren't UTF-8 text (silence, etc.)
-                    logger.debug(f"{self}: Skipping non-UTF8 frame")
-                    pass
-
-            await self.push_frame(frame, direction)
-        else:
-            await super().process_frame(frame, direction)
-
     async def write_audio_frame(self, frame: Frame) -> bool:
         """Write audio frame to output (contract method).
 
-        Audio processing is handled in process_frame, so this just returns True.
+        Audio chunks are ignored for now; playback is validated via RTVI messages.
         """
         return True
 
@@ -1022,11 +1027,24 @@ class MockOutputTransport(BaseOutputTransport):
     async def send_message(self, frame: Frame):
         """Send transport message to client (contract method).
 
-        This is called when the transport wants to send a message to the client.
-        We track it in BotOutputTracker.
+        RTVIObserver serializes every observable pipeline event (bot speech, TTS chunks,
+        transcriptions, etc.) into an RTVI message. RTVIProcessor then forwards that
+        payload through send_message, so everything a real client would receive flows
+        through here. BotOutput can therefore derive the full conversation state by
+        inspecting these serialized messages alone.
         """
-        logger.debug(f"{self}: send_message called with {type(frame).__name__}")
-        await self._bot_output_tracker.add_message(frame)
+        message_payload = getattr(frame, "message", None)
+        msg_type = None
+        payload_dict = None
+        if isinstance(message_payload, BaseModel):
+            msg_type = message_payload.__class__.__name__
+            payload_dict = message_payload.model_dump(exclude_none=True)
+        elif isinstance(message_payload, dict):
+            msg_type = message_payload.get("type")
+            payload_dict = copy.deepcopy(message_payload)
+        logger.debug(f"{self}: send_message called with type={msg_type}")
+        if payload_dict is not None:
+            await self._bot_output.append_message(payload_dict)
 
 
 class MockTTSService(TTSService):
@@ -1036,14 +1054,26 @@ class MockTTSService(TTSService):
     This class simulates a streaming TTS service by encoding a string to a
     UTF-8 byte array, broken into word-based chunks. It is the symmetric
     counterpart to MockSTTService.
+
+    Args:
+        tts_delay: Per-chunk delay in seconds. Use ~0.05 for interruption tests
+                   to give bot time to produce partial speech before being cut off.
     """
+
+    def __init__(self, *, tts_delay: float = 0.0, **kwargs):
+        super().__init__(**kwargs)
+        self._tts_delay = tts_delay
 
     def can_generate_metrics(self) -> bool:
         """Indicates that this service can generate metrics."""
         return True
 
     def to_audio(self, text: str) -> AudioRawFrame:
-        audio_frame = AudioRawFrame(audio=text.encode("utf-8"), sample_rate=SAMPLE_RATE, num_channels=NUM_CHANNELS)
+        audio_frame = AudioRawFrame(
+            audio=encode_audio_text(text, padded=True),
+            sample_rate=OUTPUT_SAMPLE_RATE,
+            num_channels=NUM_CHANNELS,
+        )
         return audio_frame
 
     async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
@@ -1058,19 +1088,21 @@ class MockTTSService(TTSService):
 
         yield TTSStartedFrame()
 
-        # Split the input text into word-based chunks.
-        text_chunks = _chunk_string(text)
+        # Split the input text into payload-sized chunks.
+        text_chunks = _split_text_to_payload_chunks(text, max_bytes=FAKE_AUDIO_PACKET_BYTES)
 
         for i, chunk in enumerate(text_chunks):
-            mock_audio_data = chunk.encode("utf-8")
+            mock_audio_data = encode_audio_text(chunk, padded=True)
             if mock_audio_data:
                 audio_frame = TTSAudioRawFrame(
                     audio=mock_audio_data,
-                    sample_rate=self.sample_rate or SAMPLE_RATE,
-                    num_channels=NUM_CHANNELS
+                    sample_rate=OUTPUT_SAMPLE_RATE,
+                    num_channels=NUM_CHANNELS,
                 )
                 audio_frame.id = i
                 yield audio_frame
+                if self._tts_delay > 0:
+                    await asyncio.sleep(self._tts_delay)
             # Stop TTFB metrics after yielding the very first chunk of audio.
             if i == 0:
                 await self.stop_ttfb_metrics()
@@ -1102,8 +1134,8 @@ class MockSTTService(STTService):
         return True
 
     def to_text(self, frame: AudioRawFrame) -> str:
-        """ For unit tests to easily convert audio bytes to text."""
-        return frame.audio.decode("utf-8")
+        """For unit tests to easily convert audio bytes to text."""
+        return decode_audio_text(frame.audio, padded=False) or ""
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
         """
@@ -1140,7 +1172,7 @@ class MockSTTService(STTService):
             self._is_transcribing = False
         else:
             # Non-silence audio: decode and accumulate
-            text = audio.decode("utf-8")
+            text = decode_audio_text(audio, padded=False) or ""
             self._buffer += text
 
             if not self._is_transcribing:
@@ -1161,71 +1193,4 @@ class MockSTTService(STTService):
             if len(self._buffer) == len(text):  # This is the first chunk
                 await self.stop_ttfb_metrics()
 
-        yield None # type: ignore
-
-
-class BotResponse:
-    """Wrapper around bot output for easier test assertions.
-
-    Uses BotOutputTracker to get what was actually sent to the client.
-    This is a snapshot of the tracker's state at a point in time.
-    """
-
-    def __init__(self, tracker: BotOutputTracker):
-        self._tracker = tracker
-        self._spoken_text = tracker.last_bot_speech()
-
-    # === TEXT/SPEECH ===
-
-    @property
-    def text(self) -> str:
-        """All spoken text (decoded from audio frames)."""
-        return self._spoken_text
-
-    def said(self, text: str, case_sensitive: bool = False) -> bool:
-        """Check if bot said something containing this text.
-
-        Args:
-            text: Text to search for in bot's speech
-            case_sensitive: Whether to do case-sensitive matching (default: False)
-
-        Returns:
-            True if the text appears in any of the bot's speech
-        """
-        needle = text if case_sensitive else text.lower()
-        haystack = self.text if case_sensitive else self.text.lower()
-        return needle in haystack
-
-    # === GENERIC FRAME ACCESS ===
-
-    def get_frames_of_type(self, frame_type: Type[F]) -> List[F]:
-        """Get all captured frames of a specific type.
-
-        Args:
-            frame_type: The type of frame to filter for
-
-        Returns:
-            List of frames matching the specified type
-        """
-        return self._tracker.get_frames_of_type(frame_type)
-
-    # === DEBUGGING ===
-
-    @property
-    def all_messages(self) -> List[Frame]:
-        """All transport messages for debugging."""
-        return self._tracker.get_all_messages()
-
-    def debug_dump(self) -> str:
-        """Return formatted string showing bot output (for debugging failing tests)."""
-        messages = self.all_messages
-        lines = ["=== BotResponse Debug Dump ==="]
-        lines.append(f"Total messages: {len(messages)}")
-        lines.append(f"\nSpoken text: {self.text!r}")
-        lines.append(f"\nMessage types:")
-        for msg in messages:
-            lines.append(f"  - {type(msg).__name__}")
-        return "\n".join(lines)
-
-    def __repr__(self) -> str:
-        return f"<BotResponse: text={self.text!r}>"
+        yield None  # type: ignore

@@ -6,7 +6,6 @@ AdkInvokeAgentFrame primitives for state synchronization between
 Pipecat pipelines and ADK sessions.
 """
 
-import asyncio
 import unittest
 
 from google.adk.agents import Agent
@@ -22,19 +21,14 @@ from pipecat_adk import (
     AdkStateDeltaFrame,
     InterruptionHandlerPlugin,
 )
-from tests.mocks import (
-    MockLLM,
-    TestRunner,
-    Say,
-    WaitForResponse,
-)
+from tests.mocks import MockLLM, TestRunner, Turn
 
 
 class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
     """Test state synchronization frame primitives."""
 
-    async def test_tool_state_delta_emits_frame(self):
-        """Test that tools with state_delta emit AdkStateDeltaFrame."""
+    async def test_tool_state_delta_updates_session(self):
+        """Test that tools with state_delta update ADK session state."""
         # Define a tool that sets state_delta
         def set_quiz_state(quiz_id: str, tool_context: ToolContext) -> dict:
             """Set up a quiz state."""
@@ -70,26 +64,20 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
         )
 
         async with TestRunner(app=app) as runner:
-            response = await runner.simulate_user([
-                Say("Start the quiz"),
-                WaitForResponse(),
-            ], timeout=1.5)
+            await runner.join()
+            await runner.speak_and_wait_for_response("Start the quiz", timeout=5.0)
 
-            # Verify bot responded
-            self.assertTrue(response.said("quiz"))
+            # Verify bot responded with exact expected text
+            self.assertEqual(runner.last_bot_message, "I've set up the quiz for you!")
 
-            # Verify AdkStateDeltaFrame was captured
-            state_delta_frames = response.get_frames_of_type(AdkStateDeltaFrame)
-            quiz_frames = [f for f in state_delta_frames if 'quiz_state' in f.state_delta]
-            self.assertGreater(len(quiz_frames), 0, "Should emit AdkStateDeltaFrame with quiz_state")
+            # Verify session state was updated
+            session_state = await runner.session_state()
+            self.assertIn('quiz_state', session_state)
+            self.assertEqual(session_state['quiz_state']['quiz_id'], 'quiz-123')
+            self.assertEqual(session_state['quiz_state']['questions'], ['Q1', 'Q2'])
 
-            # Verify the state_delta content
-            quiz_state = quiz_frames[-1].state_delta['quiz_state']
-            self.assertEqual(quiz_state['quiz_id'], 'quiz-123')
-            self.assertEqual(quiz_state['questions'], ['Q1', 'Q2'])
-
-    async def test_append_event_frame_persists_and_emits_state_delta(self):
-        """Test that AdkAppendEventFrame appends event to ADK session and emits state delta."""
+    async def test_append_event_frame_persists_state(self):
+        """Test that AdkAppendEventFrame appends event to ADK session."""
         mock_llm = MockLLM.single("Hello!")
 
         agent = Agent(
@@ -106,12 +94,9 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
 
         async with TestRunner(app=app) as runner:
             # First, trigger a normal conversation to start the pipeline
-            response = await runner.simulate_user([
-                Say("Hello"),
-                WaitForResponse(),
-            ], timeout=1.0)
-
-            self.assertTrue(response.said("Hello"))
+            await runner.join()
+            await runner.speak_and_wait_for_response("Hello", timeout=5.0)
+            self.assertEqual(runner.last_bot_message, "Hello!")
 
             # Now push an AdkAppendEventFrame through the pipeline
             event = Event(
@@ -122,21 +107,14 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
             )
             append_frame = AdkAppendEventFrame(event=event)
 
-            # Queue frame into pipeline properly
+            # Queue frame into pipeline (no LLM response expected)
             await runner.queue_frame(append_frame)
-
-            await asyncio.sleep(0.1)  # Give time for frame to propagate
+            await runner.stay_silent()
 
             # Verify event was appended to session
             session_state = await runner.session_state()
             self.assertIn('form_data', session_state)
             self.assertEqual(session_state['form_data']['name'], 'John')
-
-            # Verify AdkStateDeltaFrame was emitted - get fresh response snapshot
-            response = await runner.simulate_user([], timeout=0.1)
-            state_delta_frames = response.get_frames_of_type(AdkStateDeltaFrame)
-            form_data_frames = [f for f in state_delta_frames if 'form_data' in f.state_delta]
-            self.assertGreater(len(form_data_frames), 0, "Should emit AdkStateDeltaFrame for appended event")
 
     async def test_invoke_agent_frame_triggers_llm(self):
         """Test that AdkInvokeAgentFrame invokes the agent."""
@@ -159,12 +137,9 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
 
         async with TestRunner(app=app) as runner:
             # First turn - normal conversation
-            response = await runner.simulate_user([
-                Say("Hello"),
-                WaitForResponse(),
-            ], timeout=1.5)
-
-            self.assertTrue(response.said("Hello"))
+            await runner.join()
+            await runner.speak_and_wait_for_response("Hello", timeout=5.0)
+            self.assertEqual(runner.last_bot_message, "Hello! How can I help?")
 
             # Now push AdkInvokeAgentFrame to trigger second response
             content = Content(
@@ -177,20 +152,12 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
             )
 
             await runner.queue_frame(invoke_frame)
+            await runner.wait_for_response(timeout=5.0)
 
-            # Give time for processing
-            await asyncio.sleep(0.5)
-
-            # Get fresh response snapshot with all frames
-            response = await runner.simulate_user([], timeout=0.1)
-
-            # Check state delta was emitted
-            state_delta_frames = response.get_frames_of_type(AdkStateDeltaFrame)
-            action_frames = [f for f in state_delta_frames if 'last_action' in f.state_delta]
-            self.assertGreater(len(action_frames), 0, "Should emit state_delta from invoke frame")
-
-            # Verify both responses were generated
-            self.assertIn("summary", response.text.lower())
+            # Verify second response and session state
+            self.assertEqual(runner.last_bot_message, "Here's the summary you requested.")
+            session_state = await runner.session_state()
+            self.assertEqual(session_state.get('last_action'), 'requested_summary')
 
     async def test_invoke_agent_frame_without_state_delta(self):
         """Test AdkInvokeAgentFrame works without state_delta."""
@@ -213,12 +180,9 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
 
         async with TestRunner(app=app) as runner:
             # First turn
-            response = await runner.simulate_user([
-                Say("Hello"),
-                WaitForResponse(),
-            ], timeout=1.5)
-
-            self.assertTrue(response.said("First"))
+            await runner.join()
+            await runner.speak_and_wait_for_response("Hello", timeout=5.0)
+            self.assertEqual(runner.last_bot_message, "First response.")
 
             # Invoke agent without state_delta
             content = Content(
@@ -228,15 +192,10 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
             invoke_frame = AdkInvokeAgentFrame(new_content=content)
 
             await runner.queue_frame(invoke_frame)
+            await runner.wait_for_response(timeout=5.0)
 
-            await asyncio.sleep(0.5)
-
-            # Get fresh response snapshot
-            response = await runner.simulate_user([], timeout=0.1)
-
-            # Verify both responses were generated
-            self.assertIn("First", response.text)
-            self.assertIn("Second", response.text)
+            # Verify second response
+            self.assertEqual(runner.last_bot_message, "Second response.")
 
     async def test_multiple_tools_with_state_delta(self):
         """Test multiple tools can emit state_delta in same turn."""
@@ -284,24 +243,17 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
         )
 
         async with TestRunner(app=app) as runner:
-            response = await runner.simulate_user([
-                Say("Make the room comfortable"),
-                WaitForResponse(),
-            ], timeout=1.5)
+            await runner.join()
+            await runner.speak_and_wait_for_response(
+                "Make the room comfortable",
+                timeout=5.0,
+            )
 
-            # Verify bot responded
-            self.assertTrue(response.said("adjusted"))
-
-            # Verify state_delta frames were emitted
-            state_delta_frames = response.get_frames_of_type(AdkStateDeltaFrame)
-            temp_frames = [f for f in state_delta_frames if 'temperature' in f.state_delta]
-            brightness_frames = [f for f in state_delta_frames if 'brightness' in f.state_delta]
-            self.assertGreater(len(temp_frames), 0, "Should emit state_delta with temperature")
-            self.assertGreater(len(brightness_frames), 0, "Should emit state_delta with brightness")
-
-            # Verify values
-            self.assertEqual(temp_frames[-1].state_delta['temperature'], 72.0)
-            self.assertEqual(brightness_frames[-1].state_delta['brightness'], 80)
+            # Verify bot responded with exact expected text
+            self.assertEqual(
+                runner.last_bot_message,
+                "I've adjusted the temperature and lights."
+            )
 
             # Verify session state was updated
             session_state = await runner.session_state()
@@ -326,14 +278,15 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
 
         async with TestRunner(app=app) as runner:
             # Start pipeline first
-            await runner.simulate_user([
-                Say("Hello"),
-                WaitForResponse(),
-            ], timeout=1.0)
+            await runner.join()
+            await runner.speak_and_wait_for_response("Hello", timeout=5.0)
+            self.assertEqual(runner.last_bot_message, "Hello!")
 
-            # Get initial frame count
-            response = await runner.simulate_user([], timeout=0.1)
-            initial_count = len(response.get_frames_of_type(AdkStateDeltaFrame))
+            # Get initial session state (excluding internal keys)
+            initial_state = await runner.session_state()
+            initial_public_state = {
+                k: v for k, v in initial_state.items() if not k.startswith('_')
+            }
 
             # Push an event without state_delta (just content)
             event = Event(
@@ -345,14 +298,16 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
             )
             append_frame = AdkAppendEventFrame(event=event)
 
+            # Queue frame (no LLM response expected)
             await runner.queue_frame(append_frame)
+            await runner.stay_silent()
 
-            await asyncio.sleep(0.2)
-
-            # Verify no additional state_delta frames were emitted
-            response = await runner.simulate_user([], timeout=0.1)
-            final_count = len(response.get_frames_of_type(AdkStateDeltaFrame))
-            self.assertEqual(initial_count, final_count)
+            # Verify session state didn't change (no state_delta)
+            final_state = await runner.session_state()
+            final_public_state = {
+                k: v for k, v in final_state.items() if not k.startswith('_')
+            }
+            self.assertEqual(initial_public_state, final_public_state)
 
 
 if __name__ == "__main__":

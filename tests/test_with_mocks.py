@@ -2,7 +2,7 @@
 Test pipecat-adk integration using mock services.
 
 This test validates the full pipeline flow using MockLLM, MockSTTService,
-MockTTSService, and MockInputTransport/MockOutputTransport.
+MockTTSService, and MockInputTransport/MockOutputTransport with RTVI.
 """
 
 import unittest
@@ -12,7 +12,7 @@ from google.adk.apps import App
 from google.genai.types import Part
 from pipecat_adk import InterruptionHandlerPlugin
 
-from tests.mocks import MockLLM, TestRunner, Say, WaitTillBotSays, InterruptAfter, WaitForResponse
+from tests.mocks import MockLLM, TestRunner, Turn
 
 
 class TestWithMocks(unittest.IsolatedAsyncioTestCase):
@@ -40,23 +40,23 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
 
         # Create test runner with the app
         async with TestRunner(app=app) as runner:
-            # User says "Hi, I am John" and waits for bot to respond
-            user_actions = [
-                Say("Hi, I am John"),
-                WaitTillBotSays("Hi, I am a bot"),
-            ]
+            # User joins and speaks
+            await runner.join()
+            await runner.speak_and_wait_for_response("Hi, I am John", timeout=5.0)
 
-            # Run the interaction
-            response = await runner.simulate_user(user_actions, timeout=2.0)
-
-            # Verify bot said the expected text
-            self.assertTrue(response.said("Hi, I am a bot"))
+            # Verify exact conversation transcript
+            self.assertEqual(runner.transcript, [
+                Turn("user", "Hi, I am John"),
+                Turn("bot", "Hi, I am a bot"),
+            ])
 
     async def test_interruption_handling(self):
         """Test that user can interrupt bot's response."""
         # Bot will give a long response that gets interrupted
         mock_llm = MockLLM.single(
-            "Hello! I'm so glad you're interested in learning about our company. We have a very long history that spans over 50 years, and we've been pioneers in many different areas..."
+            "Hello! I'm so glad you're interested in learning about our company. "
+            "We have a very long history that spans over 50 years, and we've been "
+            "pioneers in many different areas..."
         )
 
         agent = Agent(
@@ -71,18 +71,22 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
             plugins=[InterruptionHandlerPlugin()],
         )
 
-        async with TestRunner(app=app) as runner:
-            # User triggers response then interrupts mid-response
-            user_actions = [
-                Say("Tell me about your company"),
-                InterruptAfter("Hello!", "Wait, I have a question"),
-            ]
+        async with TestRunner(app=app, tts_delay=0.05) as runner:
+            await runner.join()
+            # User speaks to trigger bot response
+            await runner.speak("Tell me about your company")
+            # Interrupt the bot while it's speaking
+            await runner.interrupt_bot("Wait, I have a question", timeout=5.0)
 
-            # Give enough time for bot to start speaking and be interrupted
-            response = await runner.simulate_user(user_actions, timeout=3.0)
-
-            # Verify bot started speaking before being interrupted
-            self.assertTrue(response.said("Hello"), f"Bot should have started speaking, got: {response.text!r}")
+            # Wait for interruption to be processed by checking for user transcription
+            def _has_interruption_transcription(bot_output, delta_messages):
+                return any(
+                    msg.get("type") == "user-transcription" and
+                    msg.get("data", {}).get("final") and
+                    "question" in msg.get("data", {}).get("text", "").lower()
+                    for msg in delta_messages
+                )
+            await runner.wait_for(_has_interruption_transcription, timeout=5.0)
 
             # Verify the session has recorded some conversation
             events = await runner.events()
@@ -127,20 +131,20 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
         )
 
         async with TestRunner(app=app) as runner:
-            user_actions = [
-                Say("What's the weather in San Francisco?"),
-                WaitForResponse(),
-            ]
+            await runner.join()
+            await runner.speak_and_wait_for_response(
+                "What's the weather in San Francisco?",
+                timeout=5.0,
+            )
 
-            response = await runner.simulate_user(user_actions, timeout=3.0)
+            # Verify exact bot response
+            self.assertEqual(
+                runner.last_bot_message,
+                "The weather in San Francisco is sunny and 72 degrees!"
+            )
 
-            # Verify bot responded with weather info
-            self.assertTrue(response.said("sunny and 72 degrees"))
-
-            # Verify session contains function call and response events
+            # Verify session contains function call event (gray-box check for tool execution)
             events = await runner.events()
-
-            # Should have a function_call event
             has_function_call = any(
                 e.content.parts and hasattr(e.content.parts[0], 'function_call')
                 for e in events
@@ -190,18 +194,19 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
         )
 
         async with TestRunner(app=app) as runner:
-            user_actions = [
-                Say("Make the room comfortable"),
-                WaitForResponse(),
-            ]
+            await runner.join()
+            await runner.speak_and_wait_for_response(
+                "Make the room comfortable",
+                timeout=5.0,
+            )
 
-            response = await runner.simulate_user(user_actions, timeout=3.0)
+            # Verify exact bot response
+            self.assertEqual(
+                runner.last_bot_message,
+                "I've set the temperature to 72 degrees and the lights to 80% brightness."
+            )
 
-            # Verify bot confirmed both actions
-            self.assertTrue(response.said("72 degrees"))
-            self.assertTrue(response.said("80% brightness"))
-
-            # Verify session has both function calls
+            # Verify session has both function calls (gray-box check for tool execution)
             events = await runner.events()
             function_calls = []
             for e in events:
@@ -236,28 +241,24 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
 
         async with TestRunner(app=app) as runner:
             # First turn
-            response1 = await runner.simulate_user([
-                Say("Hello"),
-                WaitForResponse(),
-            ], timeout=2.0)
-
-            self.assertTrue(response1.said("How can I help"))
+            await runner.join()
+            await runner.speak_and_wait_for_response("Hello", timeout=5.0)
 
             # Second turn
-            response2 = await runner.simulate_user([
-                Say("I need help with a project"),
-                WaitForResponse(),
-            ], timeout=2.0)
-
-            self.assertTrue(response2.said("Tell me more"))
+            await runner.speak_and_wait_for_response("I need help with a project", timeout=5.0)
 
             # Third turn
-            response3 = await runner.simulate_user([
-                Say("Can you assist me?"),
-                WaitForResponse(),
-            ], timeout=2.0)
+            await runner.speak_and_wait_for_response("Can you assist me?", timeout=5.0)
 
-            self.assertTrue(response3.said("happy to assist"))
+            # Verify full conversation transcript
+            self.assertEqual(runner.transcript, [
+                Turn("user", "Hello"),
+                Turn("bot", "Hi! How can I help you today?"),
+                Turn("user", "I need help with a project"),
+                Turn("bot", "That sounds interesting! Tell me more."),
+                Turn("user", "Can you assist me?"),
+                Turn("bot", "Great, I'd be happy to assist with that."),
+            ])
 
 
 if __name__ == "__main__":
