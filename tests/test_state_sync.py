@@ -6,7 +6,6 @@ AdkInvokeAgentFrame primitives for state synchronization between
 Pipecat pipelines and ADK sessions.
 """
 
-import asyncio
 import unittest
 
 from google.adk.agents import Agent
@@ -112,7 +111,8 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
             if runner.task:
                 await runner.task.queue_frame(append_frame)
 
-            await asyncio.sleep(0.2)  # Give time for frame to propagate
+            # Use stay_silent to process async frame (no LLM response expected)
+            await runner.stay_silent()
 
             # Verify event was appended to session
             session_state = await runner.session_state()
@@ -301,7 +301,8 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
             if runner.task:
                 await runner.task.queue_frame(append_frame)
 
-            await asyncio.sleep(0.2)
+            # Use stay_silent to process async frame (no LLM response expected)
+            await runner.stay_silent()
 
             # Verify session state didn't change (no state_delta)
             final_state = await runner.session_state()

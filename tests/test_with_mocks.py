@@ -75,8 +75,15 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
             # Interrupt the bot while it's speaking
             await runner.interrupt_bot("Wait, I have a question", timeout=5.0)
 
-            # Give time for interruption to be processed
-            await runner.stay_silent(iterations=50, delay=0.02)
+            # Wait for interruption to be processed by checking for user transcription
+            def _has_interruption_transcription(bot_output, delta_messages):
+                return any(
+                    msg.get("type") == "user-transcription" and
+                    msg.get("data", {}).get("final") and
+                    "question" in msg.get("data", {}).get("text", "").lower()
+                    for msg in delta_messages
+                )
+            await runner.wait_for(_has_interruption_transcription, timeout=5.0)
 
             # Verify the session has recorded some conversation
             events = await runner.events()
