@@ -662,6 +662,20 @@ class TestRunner:
         self._ensure_joined()
         await self.mock_input.push_message(message_type, data)
 
+    async def queue_frame(self, frame: Frame):
+        """Queue a frame into the pipeline task.
+
+        Use this to inject frames like AdkAppendEventFrame or AdkInvokeAgentFrame
+        directly into the pipeline for processing.
+
+        Raises:
+            RuntimeError: If join() hasn't been called or task doesn't exist.
+        """
+        self._ensure_joined()
+        if self.task is None:
+            raise RuntimeError("Pipeline task not initialized")
+        await self.task.queue_frame(frame)
+
     async def stay_silent(self, iterations: int = 10, delay: float = 0.01):
         """Push silence frames without waiting for response.
 

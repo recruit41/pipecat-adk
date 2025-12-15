@@ -44,8 +44,11 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
             await runner.join()
             await runner.speak_and_wait_for_response("Hi, I am John", timeout=5.0)
 
-            # Verify bot said the expected text
-            self.assertIn("Hi, I am a bot", runner.last_bot_message)
+            # Verify exact conversation transcript
+            self.assertEqual(runner.transcript, [
+                Turn("user", "Hi, I am John"),
+                Turn("bot", "Hi, I am a bot"),
+            ])
 
     async def test_interruption_handling(self):
         """Test that user can interrupt bot's response."""
@@ -134,13 +137,14 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
                 timeout=5.0,
             )
 
-            # Verify bot responded with weather info
-            self.assertIn("sunny and 72 degrees", runner.last_bot_message)
+            # Verify exact bot response
+            self.assertEqual(
+                runner.last_bot_message,
+                "The weather in San Francisco is sunny and 72 degrees!"
+            )
 
-            # Verify session contains function call and response events
+            # Verify session contains function call event (gray-box check for tool execution)
             events = await runner.events()
-
-            # Should have a function_call event
             has_function_call = any(
                 e.content.parts and hasattr(e.content.parts[0], 'function_call')
                 for e in events
@@ -196,11 +200,13 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
                 timeout=5.0,
             )
 
-            # Verify bot confirmed both actions
-            self.assertIn("72 degrees", runner.last_bot_message)
-            self.assertIn("80% brightness", runner.last_bot_message)
+            # Verify exact bot response
+            self.assertEqual(
+                runner.last_bot_message,
+                "I've set the temperature to 72 degrees and the lights to 80% brightness."
+            )
 
-            # Verify session has both function calls
+            # Verify session has both function calls (gray-box check for tool execution)
             events = await runner.events()
             function_calls = []
             for e in events:
@@ -237,15 +243,22 @@ class TestWithMocks(unittest.IsolatedAsyncioTestCase):
             # First turn
             await runner.join()
             await runner.speak_and_wait_for_response("Hello", timeout=5.0)
-            self.assertIn("How can I help", runner.last_bot_message)
 
             # Second turn
             await runner.speak_and_wait_for_response("I need help with a project", timeout=5.0)
-            self.assertIn("Tell me more", runner.last_bot_message)
 
             # Third turn
             await runner.speak_and_wait_for_response("Can you assist me?", timeout=5.0)
-            self.assertIn("happy to assist", runner.last_bot_message)
+
+            # Verify full conversation transcript
+            self.assertEqual(runner.transcript, [
+                Turn("user", "Hello"),
+                Turn("bot", "Hi! How can I help you today?"),
+                Turn("user", "I need help with a project"),
+                Turn("bot", "That sounds interesting! Tell me more."),
+                Turn("user", "Can you assist me?"),
+                Turn("bot", "Great, I'd be happy to assist with that."),
+            ])
 
 
 if __name__ == "__main__":

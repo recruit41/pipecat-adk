@@ -21,7 +21,7 @@ from pipecat_adk import (
     AdkStateDeltaFrame,
     InterruptionHandlerPlugin,
 )
-from tests.mocks import MockLLM, TestRunner
+from tests.mocks import MockLLM, TestRunner, Turn
 
 
 class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
@@ -67,8 +67,8 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
             await runner.join()
             await runner.speak_and_wait_for_response("Start the quiz", timeout=5.0)
 
-            # Verify bot responded
-            self.assertIn("quiz", runner.last_bot_message.lower())
+            # Verify bot responded with exact expected text
+            self.assertEqual(runner.last_bot_message, "I've set up the quiz for you!")
 
             # Verify session state was updated
             session_state = await runner.session_state()
@@ -96,7 +96,7 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
             # First, trigger a normal conversation to start the pipeline
             await runner.join()
             await runner.speak_and_wait_for_response("Hello", timeout=5.0)
-            self.assertIn("Hello", runner.last_bot_message)
+            self.assertEqual(runner.last_bot_message, "Hello!")
 
             # Now push an AdkAppendEventFrame through the pipeline
             event = Event(
@@ -107,11 +107,8 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
             )
             append_frame = AdkAppendEventFrame(event=event)
 
-            # Queue frame into pipeline
-            if runner.task:
-                await runner.task.queue_frame(append_frame)
-
-            # Use stay_silent to process async frame (no LLM response expected)
+            # Queue frame into pipeline (no LLM response expected)
+            await runner.queue_frame(append_frame)
             await runner.stay_silent()
 
             # Verify event was appended to session
@@ -142,7 +139,7 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
             # First turn - normal conversation
             await runner.join()
             await runner.speak_and_wait_for_response("Hello", timeout=5.0)
-            self.assertIn("Hello", runner.last_bot_message)
+            self.assertEqual(runner.last_bot_message, "Hello! How can I help?")
 
             # Now push AdkInvokeAgentFrame to trigger second response
             content = Content(
@@ -154,13 +151,11 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
                 state_delta={'last_action': 'requested_summary'}
             )
 
-            if runner.task:
-                await runner.task.queue_frame(invoke_frame)
-
-            # Wait for processing
+            await runner.queue_frame(invoke_frame)
             await runner.wait_for_response(timeout=5.0)
 
-            # Verify session state was updated
+            # Verify second response and session state
+            self.assertEqual(runner.last_bot_message, "Here's the summary you requested.")
             session_state = await runner.session_state()
             self.assertEqual(session_state.get('last_action'), 'requested_summary')
 
@@ -187,7 +182,7 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
             # First turn
             await runner.join()
             await runner.speak_and_wait_for_response("Hello", timeout=5.0)
-            self.assertIn("First", runner.last_bot_message)
+            self.assertEqual(runner.last_bot_message, "First response.")
 
             # Invoke agent without state_delta
             content = Content(
@@ -196,13 +191,11 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
             )
             invoke_frame = AdkInvokeAgentFrame(new_content=content)
 
-            if runner.task:
-                await runner.task.queue_frame(invoke_frame)
-
+            await runner.queue_frame(invoke_frame)
             await runner.wait_for_response(timeout=5.0)
 
             # Verify second response
-            self.assertIn("Second", runner.last_bot_message)
+            self.assertEqual(runner.last_bot_message, "Second response.")
 
     async def test_multiple_tools_with_state_delta(self):
         """Test multiple tools can emit state_delta in same turn."""
@@ -256,8 +249,11 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
                 timeout=5.0,
             )
 
-            # Verify bot responded
-            self.assertIn("adjusted", runner.last_bot_message.lower())
+            # Verify bot responded with exact expected text
+            self.assertEqual(
+                runner.last_bot_message,
+                "I've adjusted the temperature and lights."
+            )
 
             # Verify session state was updated
             session_state = await runner.session_state()
@@ -284,9 +280,13 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
             # Start pipeline first
             await runner.join()
             await runner.speak_and_wait_for_response("Hello", timeout=5.0)
+            self.assertEqual(runner.last_bot_message, "Hello!")
 
-            # Get initial session state
+            # Get initial session state (excluding internal keys)
             initial_state = await runner.session_state()
+            initial_public_state = {
+                k: v for k, v in initial_state.items() if not k.startswith('_')
+            }
 
             # Push an event without state_delta (just content)
             event = Event(
@@ -298,18 +298,16 @@ class TestStateSyncFrames(unittest.IsolatedAsyncioTestCase):
             )
             append_frame = AdkAppendEventFrame(event=event)
 
-            if runner.task:
-                await runner.task.queue_frame(append_frame)
-
-            # Use stay_silent to process async frame (no LLM response expected)
+            # Queue frame (no LLM response expected)
+            await runner.queue_frame(append_frame)
             await runner.stay_silent()
 
             # Verify session state didn't change (no state_delta)
             final_state = await runner.session_state()
-            # State should be the same (only internal keys may differ)
-            for key in initial_state:
-                if not key.startswith('_'):
-                    self.assertEqual(initial_state[key], final_state.get(key))
+            final_public_state = {
+                k: v for k, v in final_state.items() if not k.startswith('_')
+            }
+            self.assertEqual(initial_public_state, final_public_state)
 
 
 if __name__ == "__main__":

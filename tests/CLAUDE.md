@@ -114,6 +114,7 @@ MockLLM.from_parts([
 | `speak_and_wait_for_response(text)` | Speak and wait for bot reply |
 | `interrupt_bot(text)` | Wait for bot to start speaking, then interrupt |
 | `push_message(type, data)` | Send client message |
+| `queue_frame(frame)` | Queue a frame (e.g., AdkAppendEventFrame) into pipeline |
 | `stay_silent()` | Push silence frames to process async messages |
 | `wait_for_response()` | Wait for bot to finish speaking |
 | `wait_for(predicate)` | Wait for custom condition |
@@ -167,6 +168,22 @@ If the message does NOT trigger an LLM response, use `stay_silent()` to ensure i
 await runner.push_message("state-update", data)
 await runner.stay_silent()
 state = await runner.session_state()  # Now safe to assert
+```
+
+## Queueing Frames Directly
+
+Use `queue_frame()` to inject ADK frames directly into the pipeline:
+
+```python
+# Append an event to ADK session (no LLM response)
+event = Event(author="user", actions=EventActions(state_delta={"key": "value"}))
+await runner.queue_frame(AdkAppendEventFrame(event=event))
+await runner.stay_silent()  # Process async frame
+
+# Invoke agent with new content (triggers LLM response)
+content = Content(role="user", parts=[Part(text="Please summarize.")])
+await runner.queue_frame(AdkInvokeAgentFrame(new_content=content))
+await runner.wait_for_response()  # Wait for LLM response
 ```
 
 ## Custom Wait Conditions
