@@ -13,7 +13,7 @@ from tests.mocks import MockLLM
 from tests.test_utils import simplify_events
 from pipecat_adk import AdkBasedLLMService, SessionParams, InterruptionHandlerPlugin
 from google.adk.agents import Agent
-from google.adk.apps.app import App
+from google.adk.apps.app import App, ResumabilityConfig
 from google.adk.sessions import InMemorySessionService
 
 
@@ -37,6 +37,7 @@ class TestAdkBasedLLMService(unittest.IsolatedAsyncioTestCase):
             name=self.session_params.app_name,
             root_agent=agent,
             plugins=[InterruptionHandlerPlugin()],
+            resumability_config=ResumabilityConfig(is_resumable=True),
         )
 
     async def test_basic_text_response(self):

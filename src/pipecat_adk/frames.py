@@ -75,3 +75,27 @@ class AdkInvokeAgentFrame(SystemFrame):
     """
     new_content: genai_types.Content
     state_delta: dict[str, Any] | None = None
+
+
+@dataclass
+class AdkContextFrame(SystemFrame):
+    """Context frame carrying invocation_id for ADK agent invocation.
+
+    Created by AdkUserContextAggregator after saving the user's message
+    to the ADK session. AdkBasedLLMService uses the invocation_id to
+    call runner.run_async() and resume the invocation.
+
+    This frame replaces OpenAILLMContextFrame in the ADK pipeline.
+    Unlike OpenAILLMContextFrame which carries conversation messages,
+    this frame only carries a reference (invocation_id) because ADK
+    manages conversation history in its own session store.
+
+    Example:
+        # In AdkUserContextAggregator.push_aggregation()
+        await self.push_frame(AdkContextFrame(invocation_id="e-abc123"))
+
+        # In AdkBasedLLMService.process_frame()
+        if isinstance(frame, AdkContextFrame):
+            await self._run_adk(invocation_id=frame.invocation_id)
+    """
+    invocation_id: str

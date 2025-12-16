@@ -238,6 +238,55 @@ These parts are included with every user message.
 
 **Tradeoff**: This runs on every user message. Keep it lightweight—avoid slow database queries or API calls here.
 
+## Pipecat Ecosystem Limitations
+
+pipecat-adk takes a fundamentally different approach to context management: **ADK owns the conversation history**, not Pipecat. This architectural decision enables ADK's powerful session management, but means some Pipecat ecosystem components won't work as expected.
+
+### Why This Matters
+
+Standard Pipecat components expect to read/write messages via `OpenAILLMContext`. Since ADK manages conversation history in its own session store, our context frames only carry an `invocation_id` reference—not the actual messages.
+
+### Incompatible Components
+
+| Component | What It Does | Why It's Incompatible |
+|-----------|--------------|----------------------|
+| **RTVI Processor** | Sends user message notifications to clients | Expects to read messages from context frames |
+| **Mem0 Memory Service** | Enhances context with retrieved memories | Expects to add messages to context before LLM |
+| **LangChain Framework** | Routes to LangChain agents | Alternative agent framework—use ADK or LangChain, not both |
+| **Strands Framework** | Routes to Strands agents | Alternative agent framework—use ADK or Strands, not both |
+| **IVR Navigator** | Stores messages for IVR mode switching | Expects to read/store messages from context |
+| **LLM Log Observer** | Logs conversation messages | Will show empty context (use ADK session inspection instead) |
+
+### Workarounds
+
+**For RTVI-style client notifications:**
+Instead of relying on RTVI's context inspection, emit custom frames from your transport when user messages are processed. You can access the message content in `AdkUserContextAggregator` before it's saved to ADK.
+
+**For memory/RAG integration:**
+Use ADK's built-in state management or implement memory retrieval in your agent's instruction template. ADK tools can also fetch and inject context.
+
+**For debugging/logging:**
+Inspect ADK sessions directly instead of relying on context observers:
+```python
+session = await session_service.get_session(
+    app_name=session_params.app_name,
+    user_id=session_params.user_id,
+    session_id=session_params.session_id,
+)
+for event in session.events:
+    print(f"{event.author}: {event.content}")
+```
+
+### Compatible Components
+
+These Pipecat components work normally with pipecat-adk:
+- **STT services** (Google, Deepgram, etc.)
+- **TTS services** (Google, ElevenLabs, etc.)
+- **VAD analyzers** (Silero, WebRTC)
+- **Transports** (WebRTC, WebSocket)
+- **STTMuteFilter** (receives function call lifecycle frames)
+- **UserIdleProcessor** (receives lifecycle frames)
+
 ## Complete Example
 
 See [`examples/assistant/`](examples/assistant/) for a complete working application:

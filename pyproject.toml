@@ -22,7 +22,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "pipecat-ai>=0.0.94",
+    "pipecat-ai>=0.0.97",
     "google-adk>=1.18.0",
     "google-genai>=1.51.0",
     "google-cloud-texttospeech>=2.33.0",

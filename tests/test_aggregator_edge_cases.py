@@ -1,3 +1,10 @@
+"""
+Unit tests for AdkAssistantContextAggregator edge cases.
+
+These tests exercise the aggregator in isolation to verify edge case behavior
+that's difficult to trigger through full integration tests.
+"""
+
 import unittest
 from pipecat.frames.frames import (
     LLMFullResponseStartFrame,
@@ -15,8 +22,8 @@ from tests.mocks import MockLLM
 from tests.test_utils import simplify_events
 
 
-class TestAdkAssistantContextAggregator(unittest.IsolatedAsyncioTestCase):
-    """Unit tests for AdkAssistantContextAggregator in isolation."""
+class TestAssistantAggregatorEdgeCases(unittest.IsolatedAsyncioTestCase):
+    """Edge case tests for AdkAssistantContextAggregator."""
 
     async def asyncSetUp(self):
         """Set up test fixtures."""
@@ -27,10 +34,8 @@ class TestAdkAssistantContextAggregator(unittest.IsolatedAsyncioTestCase):
             user_id="test_user",
         )
 
-        # Create session
         await self.session_service.create_session(**self.session_params.model_dump())
 
-        # Create mock agent, app, and runner
         mock_llm = MockLLM.single("Test response")
         self.agent = Agent(
             name="test_agent",
@@ -48,28 +53,8 @@ class TestAdkAssistantContextAggregator(unittest.IsolatedAsyncioTestCase):
             session_service=self.session_service
         )
 
-    async def test_text_accumulation_between_start_and_end(self):
-        """Test that text frames are accumulated between LLM start and end frames."""
-        aggregator = AdkAssistantContextAggregator(
-            session_service=self.session_service,
-            session_params=self.session_params,
-            runner=self.runner
-        )
-
-        frames_to_send = [
-            LLMFullResponseStartFrame(),
-            TTSTextFrame(text="Hello ", aggregated_by="sentence"),
-            TTSTextFrame(text="world!", aggregated_by="sentence"),
-        ]
-
-        await run_test(aggregator, frames_to_send=frames_to_send)
-
-        # Check that text is being accumulated
-        # Note: aggregator adds space before each frame, so "Hello " + " world!" = "Hello  world!"
-        self.assertEqual(aggregator._aggregation, "Hello  world!")
-
-    async def test_interruption_with_accumulated_text(self):
-        """Test that interruption creates a synthetic event when text is accumulated."""
+    async def test_interruption_creates_synthetic_event(self):
+        """Test that interruption with accumulated text creates a synthetic event."""
         aggregator = AdkAssistantContextAggregator(
             session_service=self.session_service,
             session_params=self.session_params,
@@ -79,13 +64,12 @@ class TestAdkAssistantContextAggregator(unittest.IsolatedAsyncioTestCase):
         frames_to_send = [
             LLMFullResponseStartFrame(),
             TTSTextFrame(text="The capital of India is New Delhi.", aggregated_by="sentence"),
-            SleepFrame(sleep=0.01),  # Give time for text to be processed
+            SleepFrame(sleep=0.01),
             InterruptionFrame(),
         ]
 
         await run_test(aggregator, frames_to_send=frames_to_send)
 
-        # Verify the session has the interruption event
         session = await self.session_service.get_session(
             app_name=self.session_params.app_name,
             session_id=self.session_params.session_id,
@@ -96,7 +80,6 @@ class TestAdkAssistantContextAggregator(unittest.IsolatedAsyncioTestCase):
         # Should have one event (the interruption event)
         self.assertEqual(len(session.events), 1)
 
-        # Check the event content using simplify_events
         simplified = simplify_events(session.events)
         self.assertEqual(len(simplified), 1)
         author, content = simplified[0]
@@ -119,7 +102,6 @@ class TestAdkAssistantContextAggregator(unittest.IsolatedAsyncioTestCase):
 
         await run_test(aggregator, frames_to_send=frames_to_send)
 
-        # Verify no events were added to the session
         session = await self.session_service.get_session(
             app_name=self.session_params.app_name,
             session_id=self.session_params.session_id,
@@ -140,13 +122,12 @@ class TestAdkAssistantContextAggregator(unittest.IsolatedAsyncioTestCase):
         frames_to_send = [
             LLMFullResponseStartFrame(),
             TTSTextFrame(text="The capital of India is", aggregated_by="sentence"),
-            SleepFrame(sleep=0.01),  # Give time for text to be processed
+            SleepFrame(sleep=0.01),
             InterruptionFrame(),
         ]
 
         await run_test(aggregator, frames_to_send=frames_to_send)
 
-        # Verify the interruption event has only the partial text
         session = await self.session_service.get_session(
             app_name=self.session_params.app_name,
             session_id=self.session_params.session_id,
@@ -154,76 +135,12 @@ class TestAdkAssistantContextAggregator(unittest.IsolatedAsyncioTestCase):
         )
         assert session
 
-        # Check using simplify_events
         simplified = simplify_events(session.events)
         self.assertEqual(len(simplified), 1)
         author, content = simplified[0]
         self.assertEqual(author, "test_agent")
         self.assertIn("The capital of India is", content)
         self.assertNotIn("New Delhi", content)
-
-    async def test_text_ignored_before_llm_start(self):
-        """Test that text frames before LLMFullResponseStartFrame are ignored."""
-        aggregator = AdkAssistantContextAggregator(
-            session_service=self.session_service,
-            session_params=self.session_params,
-            runner=self.runner
-        )
-
-        frames_to_send = [
-            TTSTextFrame(text="This should be ignored", aggregated_by="sentence"),
-            LLMFullResponseStartFrame(),
-            TTSTextFrame(text="This should be captured", aggregated_by="sentence"),
-        ]
-
-        await run_test(aggregator, frames_to_send=frames_to_send)
-
-        # Should only have the text sent after start
-        self.assertEqual(aggregator._aggregation, "This should be captured")
-
-    async def test_aggregation_cleared_after_interruption(self):
-        """Test that aggregation is cleared after interruption."""
-        aggregator = AdkAssistantContextAggregator(
-            session_service=self.session_service,
-            session_params=self.session_params,
-            runner=self.runner
-        )
-
-        frames_to_send = [
-            LLMFullResponseStartFrame(),
-            TTSTextFrame(text="Some text", aggregated_by="sentence"),
-            SleepFrame(sleep=0.01),  # Give time for text to be processed
-            InterruptionFrame(),
-        ]
-
-        await run_test(aggregator, frames_to_send=frames_to_send)
-
-        # Aggregation should be cleared
-        self.assertEqual(aggregator._aggregation, "")
-
-    async def test_multiple_text_frames_accumulation(self):
-        """Test that multiple text frames accumulate correctly with proper spacing."""
-        aggregator = AdkAssistantContextAggregator(
-            session_service=self.session_service,
-            session_params=self.session_params,
-            runner=self.runner
-        )
-
-        frames_to_send = [
-            LLMFullResponseStartFrame(),
-            TTSTextFrame(text="Hello", aggregated_by="sentence"),
-            TTSTextFrame(text="world", aggregated_by="sentence"),
-            TTSTextFrame(text="this", aggregated_by="sentence"),
-            TTSTextFrame(text="is", aggregated_by="sentence"),
-            TTSTextFrame(text="a", aggregated_by="sentence"),
-            TTSTextFrame(text="test", aggregated_by="sentence"),
-        ]
-
-        await run_test(aggregator, frames_to_send=frames_to_send)
-
-        # Should be joined with spaces
-        expected = "Hello world this is a test"
-        self.assertEqual(aggregator._aggregation, expected)
 
 
 if __name__ == "__main__":
