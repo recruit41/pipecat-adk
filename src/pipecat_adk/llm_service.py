@@ -14,6 +14,7 @@ from typing import Any, Optional
 from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.adk.apps.app import App
 from google.adk.events.event import Event
+from google.adk.events.event_actions import EventActions
 from google.adk.runners import Runner
 from google.adk.sessions.base_session_service import BaseSessionService
 from google.genai.types import FunctionCall, FunctionResponse
@@ -164,23 +165,24 @@ class AdkBasedLLMService(LLMService):
         - AdkContextFrame: Invokes ADK with the invocation_id
         - AdkAppendEventFrame: Appends event to session without LLM invocation
         - AdkInvokeAgentFrame: Programmatic agent invocation
+
+        All other frames are forwarded through the pipeline.
         """
+        # Always call super first to handle system frames (StartFrame, etc.)
+        await super().process_frame(frame, direction)
+
         # Handle ADK context frame - this is the main entry point
         if isinstance(frame, AdkContextFrame):
             await self._run_adk(invocation_id=frame.invocation_id)
-            return
-
         # Handle append event frame - persist without LLM call
-        if isinstance(frame, AdkAppendEventFrame):
+        elif isinstance(frame, AdkAppendEventFrame):
             await self._handle_append_event(frame)
-            return
-
         # Handle invoke agent frame - programmatic invocation
-        if isinstance(frame, AdkInvokeAgentFrame):
+        elif isinstance(frame, AdkInvokeAgentFrame):
             await self._handle_invoke_agent(frame)
-            return
-
-        await super().process_frame(frame, direction)
+        else:
+            # Forward all other frames through the pipeline
+            await self.push_frame(frame, direction)
 
     async def _handle_append_event(self, frame: AdkAppendEventFrame) -> None:
         """Append event to ADK session and emit state delta if present."""
@@ -224,13 +226,17 @@ class AdkBasedLLMService(LLMService):
             )
 
         # Create event and save to session first
+        # Include state_delta in the event's actions to persist it to session state
         invocation_id = Event.new_id()
-        event = Event(
-            invocation_id=invocation_id,
-            author="user",
-            content=frame.new_content,
-            timestamp=time.time(),
-        )
+        event_kwargs = {
+            "invocation_id": invocation_id,
+            "author": "user",
+            "content": frame.new_content,
+            "timestamp": time.time(),
+        }
+        if frame.state_delta:
+            event_kwargs["actions"] = EventActions(state_delta=frame.state_delta)
+        event = Event(**event_kwargs)
         await self.session_service.append_event(session, event)
 
         # Now invoke ADK with the invocation_id

@@ -68,7 +68,6 @@ class AdkUserContextAggregator(LLMUserContextAggregator):
         super().__init__(context=self._dummy_context, params=params)
         self.session_service = session_service
         self.session_params = session_params
-        self._pending_invocation_id: Optional[str] = None
 
     def _assert_context_empty(self) -> None:
         """Assert that Pipecat's context has no messages (ADK manages them)."""
@@ -78,17 +77,24 @@ class AdkUserContextAggregator(LLMUserContextAggregator):
             "ADK manages conversation history, not Pipecat."
         )
 
-    async def handle_aggregation(self, aggregation: str) -> None:
-        """Save user message to ADK session immediately.
+    async def _process_aggregation(self) -> None:
+        """Process aggregated user speech: save to ADK and push context frame.
 
-        This is called when user speech has been fully transcribed.
-        We save to ADK session right away so the message persists
-        even if the pipeline is interrupted.
+        Overrides the base class to:
+        1. Save user message to ADK session immediately
+        2. Push AdkContextFrame (not OpenAILLMContextFrame)
 
-        Args:
-            aggregation: The transcribed user speech
+        This is atomic - no shared state between methods.
         """
-        self._assert_context_empty()  # Defensive check
+        aggregation = self._aggregation
+        await self.reset()
+
+        if not aggregation:
+            logger.warning("[AdkUserContextAggregator] Empty aggregation, skipping")
+            return
+
+        logger.debug(f"[AdkUserContextAggregator] Processing aggregation: '{aggregation}'")
+        self._assert_context_empty()
 
         # Create user message content
         content = await self._aggregation_to_content(aggregation)
@@ -119,12 +125,10 @@ class AdkUserContextAggregator(LLMUserContextAggregator):
         # Save immediately to ADK session
         await self.session_service.append_event(session, event)
 
-        # Store for push_aggregation
-        self._pending_invocation_id = invocation_id
+        logger.debug(f"Saved user message to ADK session with invocation_id={invocation_id}")
 
-        logger.debug(
-            f"Saved user message to ADK session with invocation_id={invocation_id}"
-        )
+        # Push frame to trigger LLM
+        await self.push_frame(AdkContextFrame(invocation_id=invocation_id))
 
     async def _aggregation_to_content(self, aggregation: str) -> Content:
         """Convert aggregated text to Google Content format.
@@ -140,21 +144,6 @@ class AdkUserContextAggregator(LLMUserContextAggregator):
         """
         parts = [Part(text=aggregation)]
         return Content(role="user", parts=parts)
-
-    async def push_aggregation(self) -> None:
-        """Push AdkContextFrame instead of OpenAILLMContextFrame.
-
-        This is called after handle_aggregation to trigger the LLM.
-        We push AdkContextFrame with the invocation_id so the LLM service
-        can resume the invocation.
-        """
-        self._assert_context_empty()  # Defensive check
-
-        if self._pending_invocation_id:
-            await self.push_frame(
-                AdkContextFrame(invocation_id=self._pending_invocation_id)
-            )
-            self._pending_invocation_id = None
 
 
 class AdkAssistantContextAggregator(LLMAssistantContextAggregator):

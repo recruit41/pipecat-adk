@@ -23,7 +23,8 @@ from google.adk.models.base_llm import BaseLlm
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.genai.types import Content, Part
-from pipecat.observers.loggers.debug_log_observer import DebugLogObserver
+
+from tests.debug_observer import AdkDebugLogObserver
 
 from loguru import logger
 from pydantic import BaseModel
@@ -236,18 +237,18 @@ class BotOutput:
                     convo.append(Turn(speaker="bot", text=text))
             elif msg_type == "interruption" and in_bot_turn:
                 # Flush whatever the bot has said so far to capture partial speech
-                convo.append(Turn(speaker="bot", text="".join(bot_buffer)))
+                convo.append(Turn(speaker="bot", text=" ".join(bot_buffer)))
                 bot_buffer = []
                 in_bot_turn = False
             elif msg_type == "bot-stopped-speaking" and in_bot_turn:
-                convo.append(Turn(speaker="bot", text="".join(bot_buffer)))
+                convo.append(Turn(speaker="bot", text=" ".join(bot_buffer)))
                 bot_buffer = []
                 in_bot_turn = False
             elif msg_type == "user-transcription" and data.get("final"):
                 convo.append(Turn(speaker="user", text=data.get("text", "")))
 
         if bot_buffer:
-            convo.append(Turn(speaker="bot", text="".join(bot_buffer)))
+            convo.append(Turn(speaker="bot", text=" ".join(bot_buffer)))
 
         return convo
 
@@ -621,11 +622,14 @@ class TestRunner:
         self.task = PipelineTask(
             self.pipeline,
             params=PipelineParams(allow_interruptions=True),
-            observers=[RTVIObserver(self._rtvi), DebugLogObserver()],
+            observers=[RTVIObserver(self._rtvi), AdkDebugLogObserver()],
         )
         self.runner = PipelineRunner()
         self._pipeline_task = asyncio.create_task(self.runner.run(self.task))
-        await asyncio.sleep(0.05)
+        # Wait for StartFrame to fully propagate through all processors.
+        # This ensures __process_queue is created on all processors before
+        # any other frames are processed.
+        await asyncio.sleep(0.2)
 
     def _ensure_joined(self):
         """Raise if join() hasn't been called."""
@@ -633,8 +637,16 @@ class TestRunner:
             raise RuntimeError("TestRunner.join() must be called before driving the pipeline")
 
     async def join(self):
-        """Simulate the client joining/connecting."""
-        await self._ensure_started()
+        """Simulate the client joining/connecting.
+
+        Note: Pipeline must be started before calling join(). This happens
+        automatically when using the context manager (async with TestRunner).
+        """
+        if self.task is None:
+            raise RuntimeError(
+                "Pipeline not started. Use 'async with TestRunner(app) as runner:' "
+                "to ensure the pipeline is started before calling join()."
+            )
         if self._joined:
             return
         participant = {"id": "test-user", "name": "Test User"}
@@ -763,6 +775,12 @@ class TestRunner:
             **self.session_params.model_dump()
         )
         assert session is not None
+
+        # Start the pipeline in __aenter__ (not in join)
+        # This ensures StartFrame propagates to all processors before
+        # any user input can flow through the pipeline
+        await self._ensure_started()
+
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -1061,7 +1079,7 @@ class MockTTSService(TTSService):
     """
 
     def __init__(self, *, tts_delay: float = 0.0, **kwargs):
-        super().__init__(**kwargs)
+        super().__init__(sample_rate=OUTPUT_SAMPLE_RATE, **kwargs)
         self._tts_delay = tts_delay
 
     def can_generate_metrics(self) -> bool:
