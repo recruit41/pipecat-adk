@@ -1,0 +1,15 @@
+{
+  "name": "pipecat-llm-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "External LLM component for pipecat-adk's WebSocketLLMService bridge",
+  "module": "src/index.ts",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
+  }
+}

@@ -798,29 +798,48 @@ class TestRunner:
 
     Args:
         app: The ADK App (name must be "agents" to match hardcoded session params).
+             Mutually exclusive with ``llm_service``.
+        llm_service: A pre-built LLM service to drive the pipeline (e.g.
+             ``WebSocketLLMService``). Use this instead of ``app`` to test a
+             non-ADK backend. No ADK session is created in this mode, so
+             ``events()`` / ``session_state()`` are unavailable.
         tts_delay: Per-chunk TTS delay in seconds. Use ~0.05 for interruption
                    tests so the bot produces partial speech before being cut off.
     """
 
-    def __init__(self, app: App, *, tts_delay: float = 0.0):
+    def __init__(
+        self,
+        app: Optional[App] = None,
+        *,
+        llm_service: Optional[Any] = None,
+        tts_delay: float = 0.0,
+    ):
+        if (app is None) == (llm_service is None):
+            raise ValueError("Provide exactly one of 'app' or 'llm_service'")
+
         self.session_params = SessionParams(
             app_name="agents",
             session_id="test_session",
             user_id="test_user",
         )
-        self.session_service = InMemorySessionService()
 
         self.transport = MockTransport()
         self.mock_input = self.transport.input()
         self.mock_output = self.transport.output()
         self._bot_output = self.transport.bot_output()
 
-        self.adk_service = AdkLLMService(
-            agent=app.root_agent,
-            session_service=self.session_service,
-            session_params=self.session_params,
-            plugins=app.plugins,
-        )
+        if llm_service is not None:
+            # Non-ADK backend (e.g. WebSocketLLMService): no ADK session.
+            self.session_service = None
+            self.llm_service = llm_service
+        else:
+            self.session_service = InMemorySessionService()
+            self.llm_service = AdkLLMService(
+                agent=app.root_agent,
+                session_service=self.session_service,
+                session_params=self.session_params,
+                plugins=app.plugins,
+            )
 
         mock_vad = MockVADAnalyzer(sample_rate=INPUT_SAMPLE_RATE)
         user_params = LLMUserAggregatorParams(
@@ -833,7 +852,7 @@ class TestRunner:
                 stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.2)],
             ),
         )
-        context_aggregators = self.adk_service.create_context_aggregator(
+        context_aggregators = self.llm_service.create_context_aggregator(
             user_params=user_params
         )
 
@@ -844,7 +863,7 @@ class TestRunner:
             self._rtvi,
             MockSTTService(),
             context_aggregators.user(),
-            self.adk_service,
+            self.llm_service,
             MockTTSService(tts_delay=tts_delay),
             self.mock_output,
             context_aggregators.assistant(),
@@ -889,10 +908,14 @@ class TestRunner:
     # ── Gray-box inspection ──────────────────────────────────────────────────
 
     async def session_state(self) -> dict:
+        if self.session_service is None:
+            raise RuntimeError("session_state() requires an ADK-backed TestRunner")
         session = await self.session_service.get_session(**self.session_params.model_dump())
         return session.state if session else {}
 
     async def events(self):
+        if self.session_service is None:
+            raise RuntimeError("events() requires an ADK-backed TestRunner")
         session = await self.session_service.get_session(**self.session_params.model_dump())
         return session.events if session else []
 
@@ -1007,8 +1030,11 @@ class TestRunner:
                 pass
 
     async def __aenter__(self):
-        session = await self.session_service.create_session(**self.session_params.model_dump())
-        assert session is not None
+        if self.session_service is not None:
+            session = await self.session_service.create_session(
+                **self.session_params.model_dump()
+            )
+            assert session is not None
         await self._ensure_started()
         return self
 

@@ -27,6 +27,10 @@ uv run python -m unittest tests.test_with_mocks.TestWithMocks.test_basic_interac
 | `tts_mixin.py` | `VqlTTSMixin` — intercepts `VqlLLMFullResponseStartFrame`, sets `_turn_context_id = frame.turn_id`; required for `[HEARD]` tracking |
 | `frames.py` | `VqlContextFrame(turn_id, text)`, `VqlInterruptionFrame(turn_id)`, `VqlLLMFullResponseStartFrame(turn_id)`, `VqlLLMTextFrame(text, turn_id)`, `VqlTurnCompletedFrame(turn_id, text, interrupted)` |
 | `types.py` | `SessionParams(app_name, user_id, session_id)` |
+| `websocket/service.py` | `WebSocketLLMService` — black-box-equivalent replacement for `AdkLLMService` that delegates LLM processing to an external (JavaScript/Bun) process over a WebSocket. See [docs/websocket-bridge.md](docs/websocket-bridge.md) |
+| `websocket/client.py` | `WebSocketBridgeClient` — hardened WebSocket client (reconnect, timeouts, heartbeat) built on Pipecat's `WebsocketService` |
+| `websocket/protocol.py` | Wire protocol — encoders/decoders, mirrored in `js-bridge/src/protocol.ts` |
+| `js-bridge/` | The external Bun LLM component: `BridgeConnection` + pluggable `LLMHandler` (not Python) |
 
 Extension points: `_build_user_event`, `_on_state_delta`, `_persist_and_run` — see [docs/architecture.md](docs/architecture.md).
 
